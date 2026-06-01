@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+import logging
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import config
+from services.finance_api import FinanceApiClient, FinanceApiError
+
+LOGGER = logging.getLogger(__name__)
+
+CASH_TARGET = 100_000
+
+
+def _money(v: float) -> str:
+    return f'R$ {v:,.0f}'.replace(',', '.')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# View efêmera: select de jogadores + confirmar  (aparece só para o gerente)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DeliveryView(discord.ui.View):
+    def __init__(self, players: list[dict], manager_name: str, api: FinanceApiClient) -> None:
+        super().__init__(timeout=300)
+
+        self.selected_ids: list[str] = []
+        self.manager_name = manager_name
+        self.api = api
+        self.players_by_id: dict[str, str] = {str(p['id']): p['name'] for p in players}
+
+        # Pendentes primeiro, depois quem já entregou; máximo 25 (limite Discord)
+        pending   = [p for p in players if float(p.get('cash_delivered', 0)) < CASH_TARGET]
+        delivered = [p for p in players if float(p.get('cash_delivered', 0)) >= CASH_TARGET]
+        ordered   = pending + delivered
+        display   = ordered[:25]
+        self._note = f'\n> ⚠️ Exibindo {len(display)} de {len(ordered)} membros.' if len(ordered) > 25 else ''
+
+        options = [
+            discord.SelectOption(
+                label=p['name'][:100],
+                value=str(p['id']),
+                description=self._desc(p),
+                emoji='✅' if float(p.get('cash_delivered', 0)) >= CASH_TARGET else '⏳',
+            )
+            for p in display
+        ]
+
+        self.select_menu = discord.ui.Select(
+            placeholder='Selecione quem entregou a meta...',
+            min_values=1,
+            max_values=len(options),
+            options=options,
+            row=0,
+        )
+        self.select_menu.callback = self._on_select
+        self.add_item(self.select_menu)
+
+        self.confirm_btn = discord.ui.Button(
+            label='Confirmar Entrega',
+            style=discord.ButtonStyle.success,
+            emoji='✅',
+            disabled=True,
+            row=1,
+        )
+        self.confirm_btn.callback = self._on_confirm
+        self.add_item(self.confirm_btn)
+
+        cancel_btn = discord.ui.Button(
+            label='Cancelar',
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    @staticmethod
+    def _desc(p: dict) -> str:
+        delivered = float(p.get('cash_delivered', 0))
+        role = (p.get('role') or '').strip()
+        if delivered >= CASH_TARGET:
+            status = 'Já entregou'
+        elif delivered > 0:
+            status = f'Parcial: {_money(delivered)}'
+        else:
+            status = 'Pendente'
+        return (f'{role} · {status}' if role else status)[:100]
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        self.selected_ids = list(self.select_menu.values)
+        self.confirm_btn.disabled = False
+        names = ', '.join(self.players_by_id.get(pid, pid) for pid in self.selected_ids)
+        await interaction.response.edit_message(
+            content=(
+                f'💰 **Registrar Entrega de Sujo**\n'
+                f'**{len(self.selected_ids)}** selecionado(s): {names}\n'
+                f'Valor: **{_money(CASH_TARGET)}** cada\n\n'
+                f'Clique em **Confirmar Entrega** para salvar.{self._note}'
+            ),
+            view=self,
+        )
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        for child in self.children:
+            child.disabled = True  # type: ignore[union-attr]
+
+        # A mensagem efêmera pode já ter expirado/apagado quando o usuário clica.
+        # Nesse caso, evitamos propagar exceção e encerramos o fluxo com aviso.
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(content='⏳ Registrando...', view=self)
+            else:
+                await interaction.message.edit(content='⏳ Registrando...', view=self)
+        except discord.NotFound:
+            LOGGER.info('cash_delivery confirm: mensagem original não encontrada para edição')
+            try:
+                await interaction.followup.send(
+                    '⚠️ Esta mensagem não está mais disponível. Abra o painel novamente e tente de novo.',
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            self.stop()
+            return
+        except discord.HTTPException as exc:
+            LOGGER.warning('cash_delivery confirm: falha ao atualizar mensagem inicial: %s', exc)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    '❌ Não foi possível iniciar o registro agora. Tente novamente.',
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    '❌ Não foi possível iniciar o registro agora. Tente novamente.',
+                    ephemeral=True,
+                )
+            self.stop()
+            return
+
+        try:
+            result = await self.api.post('discord_cash_delivery_register.php', {
+                'player_ids':   [int(pid) for pid in self.selected_ids],
+                'manager_name': self.manager_name,
+                'amount':       CASH_TARGET,
+            })
+        except FinanceApiError as exc:
+            LOGGER.warning('cash_delivery confirm error: %s', exc)
+            try:
+                await interaction.message.edit(content=f'❌ Erro ao registrar: {exc}', view=None)
+            except discord.NotFound:
+                await interaction.followup.send(f'❌ Erro ao registrar: {exc}', ephemeral=True)
+            self.stop()
+            return
+
+        registered: list[dict] = result.get('registered', [])
+        errors: list[str]      = result.get('errors', [])
+
+        # Embed visível no canal para todos verem
+        embed = discord.Embed(
+            title='💰 Entrega de Sujo Registrada',
+            color=discord.Color.green() if not errors else discord.Color.orange(),
+        )
+        if registered:
+            embed.add_field(
+                name=f'✅ Entregaram ({len(registered)})',
+                value='\n'.join(f'• {r["player_name"]}' for r in registered),
+                inline=False,
+            )
+        embed.add_field(name='Valor', value=_money(CASH_TARGET) + ' cada', inline=True)
+        embed.add_field(name='Registrado por', value=self.manager_name, inline=True)
+        if errors:
+            embed.add_field(
+                name='⚠️ Não registrados',
+                value='\n'.join(f'• {e}' for e in errors),
+                inline=False,
+            )
+
+        try:
+            await interaction.channel.send(embed=embed)
+        except discord.Forbidden:
+            LOGGER.warning('Sem permissão para enviar mensagem no canal %s', interaction.channel_id)
+
+        try:
+            await interaction.message.edit(
+                content=f'✅ **{len(registered)}** entrega(s) registrada(s) com sucesso!',
+                view=None,
+            )
+        except discord.NotFound:
+            await interaction.followup.send(
+                f'✅ **{len(registered)}** entrega(s) registrada(s) com sucesso!',
+                ephemeral=True,
+            )
+        self.stop()
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        for child in self.children:
+            child.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(content='❌ Cancelado.', view=self)
+        self.stop()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# View persistente: painel fixo no canal com o botão de registrar
+# Sobrevive a reinicializações do bot graças ao custom_id fixo.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PanelView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)  # sem timeout → persiste para sempre
+
+    @discord.ui.button(
+        label='Registrar Entrega',
+        style=discord.ButtonStyle.success,
+        emoji='💰',
+        custom_id='cash_delivery:register_btn',
+    )
+    async def register_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Verifica canal
+        channel_id = int(getattr(config, 'CASH_DELIVERY_CHANNEL_ID', 0) or 0)
+        if channel_id and interaction.channel_id != channel_id:
+            await interaction.response.send_message(
+                f'❌ Este botão só funciona em <#{channel_id}>.',
+                ephemeral=True,
+            )
+            return
+
+        # Verifica cargos
+        manager_role_ids = [int(r) for r in getattr(config, 'CASH_DELIVERY_MANAGER_ROLE_IDS', []) if r]
+        if manager_role_ids:
+            user_role_ids = [r.id for r in getattr(interaction.user, 'roles', [])]
+            has_perm = (
+                any(rid in user_role_ids for rid in manager_role_ids)
+                or getattr(getattr(interaction.user, 'guild_permissions', None), 'manage_guild', False)
+            )
+            if not has_perm:
+                await interaction.response.send_message(
+                    '❌ Apenas gerentes podem usar este botão.',
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Reutiliza o cliente de API do cog para não criar sessões desnecessárias
+        cog: CashDeliveryCog | None = interaction.client.get_cog('CashDeliveryCog')  # type: ignore[assignment]
+        api = cog.api if cog else FinanceApiClient()
+
+        try:
+            data = await api.get('discord_cash_delivery_players.php')
+        except FinanceApiError as exc:
+            LOGGER.warning('PanelView: erro ao buscar jogadores: %s', exc)
+            await interaction.followup.send(f'❌ Erro ao buscar jogadores: {exc}', ephemeral=True)
+            return
+
+        players: list[dict] = data.get('players') or []
+        if not players:
+            await interaction.followup.send('❌ Nenhum jogador cadastrado no sistema.', ephemeral=True)
+            return
+
+        manager_name = interaction.user.display_name
+        view = DeliveryView(players, manager_name, api)
+
+        pending_count = sum(1 for p in players if float(p.get('cash_delivered', 0)) < CASH_TARGET)
+
+        await interaction.followup.send(
+            f'💰 **Registrar Entrega de Sujo**\n'
+            f'Meta: **{_money(CASH_TARGET)}** por membro\n'
+            f'Pendentes esta semana: **{pending_count}** de {len(players)}\n\n'
+            f'Selecione os membros que entregaram:',
+            view=view,
+            ephemeral=True,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cog
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CashDeliveryCog(commands.Cog):
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self.api = FinanceApiClient()
+        # Registra a view persistente para que o botão funcione após reiniciar
+        bot.add_view(PanelView())
+
+    async def cog_unload(self) -> None:
+        await self.api.close()
+
+    @app_commands.command(
+        name='painel_sujo',
+        description='Posta o painel de entrega de sujo no canal (apenas admins).',
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def painel_sujo(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title='💰 Entrega de Sujo Semanal',
+            description=(
+                f'Cada membro deve entregar **{_money(CASH_TARGET)}** por semana '
+                f'para um gerente da facção.\n\n'
+                f'**Gerentes:** clique no botão abaixo para registrar quem entregou.'
+            ),
+            color=0x232323,
+        )
+        embed.set_footer(text='La Firma · O registro aparece no site automaticamente')
+
+        await interaction.response.send_message(embed=embed, view=PanelView())
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(CashDeliveryCog(bot))

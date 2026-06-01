@@ -1,0 +1,1719 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+import config
+from services.finance_api import FinanceApiClient, FinanceApiError
+
+
+logger = logging.getLogger(__name__)
+
+
+SALE_SCOPE_LABELS: dict[str, str] = {
+    'favela': 'Favela',
+    'bangalo': 'Bangalô',
+    'mansoes': 'Mansões',
+    'members': 'Membros',
+}
+
+
+def money_text(value: float) -> str:
+    return f'R$ {value:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+
+def xp_text(value: float) -> str:
+    return f'{value:,.0f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+
+def split_message_chunks(text: str, limit: int = 1900) -> list[str]:
+    content = text.strip()
+    if not content:
+        return []
+
+    if len(content) <= limit:
+        return [content]
+
+    chunks: list[str] = []
+    current = ''
+    for line in content.splitlines():
+        candidate = line if not current else current + '\n' + line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = line
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def parse_money_input(raw: str) -> float:
+    value = raw.strip().replace('R$', '').replace(' ', '')
+    if not value:
+        raise ValueError('Valor vazio.')
+    if ',' in value and '.' in value:
+        value = value.replace('.', '').replace(',', '.')
+    else:
+        value = value.replace(',', '.')
+    amount = float(value)
+    if amount <= 0:
+        raise ValueError('Valor deve ser maior que zero.')
+    return amount
+
+
+def parse_int_input(raw: str) -> int:
+    value = raw.strip()
+    if value == '':
+        return 0
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError('Quantidade não pode ser negativa.')
+    return parsed
+
+
+class TransactionModal(discord.ui.Modal):
+    def __init__(self, cog: 'FinanceCog', tx_type: str) -> None:
+        title_map = {
+            'deposito': 'Depósito no Cofre',
+            'pagamento': 'Pagamento do Cofre',
+            'saque': 'Saque do Cofre',
+        }
+        super().__init__(title=title_map.get(tx_type, 'Lançamento Financeiro'))
+        self.cog = cog
+        self.tx_type = tx_type
+
+        self.amount = discord.ui.TextInput(
+            label='Valor',
+            placeholder='Apenas números ou decimal. Ex: 5000 ou 5000,50',
+            required=True,
+            max_length=20,
+        )
+        self.reason = discord.ui.TextInput(
+            label='Descrição / Origem',
+            placeholder='Descreva a transação...',
+            required=True,
+            max_length=200,
+        )
+
+        self.add_item(self.amount)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            amount = parse_money_input(str(self.amount))
+            reason = str(self.reason).strip()
+            await interaction.response.defer(ephemeral=True)
+            await self.cog.handle_transaction(interaction, self.tx_type, amount, reason)
+        except ValueError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Entrada inválida: {exc}')
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao registrar {self.tx_type}: {exc}')
+
+
+class ClientModal(discord.ui.Modal):
+    def __init__(self, cog: 'FinanceCog', action: str) -> None:
+        title = 'Cadastrar Família' if action == 'create' else 'Remover Família'
+        super().__init__(title=title)
+        self.cog = cog
+        self.action = action
+        self.client_name = discord.ui.TextInput(
+            label='Nome da família',
+            placeholder='Ex: Ballas, Camorra, etc.',
+            required=True,
+            max_length=150,
+        )
+        self.add_item(self.client_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        name = str(self.client_name).strip()
+        try:
+            await interaction.response.defer(ephemeral=True)
+            if self.action == 'create':
+                await self.cog.handle_create_client(interaction, name)
+            else:
+                await self.cog.handle_delete_client(interaction, name)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao processar família: {exc}')
+
+
+class SaleQuantitiesModal(discord.ui.Modal):
+    def __init__(self, cog: 'FinanceCog', client_name: str, stock_scope: str, target_type: str = 'family') -> None:
+        super().__init__(title='Registrar Venda')
+        self.cog = cog
+        self.client_name = client_name
+        self.stock_scope = stock_scope
+        self.target_type = target_type
+
+        self.common = discord.ui.TextInput(label='Quantidade Comum', placeholder='0', required=False, max_length=10, default='0')
+        self.uncommon = discord.ui.TextInput(label='Quantidade Incomum', placeholder='0', required=False, max_length=10, default='0')
+        self.rare = discord.ui.TextInput(label='Quantidade Rara', placeholder='0', required=False, max_length=10, default='0')
+        self.mythic = discord.ui.TextInput(label='Quantidade Mítica', placeholder='0', required=False, max_length=10, default='0')
+        self.legendary = discord.ui.TextInput(label='Quantidade Lendária', placeholder='0', required=False, max_length=10, default='0')
+
+        self.add_item(self.common)
+        self.add_item(self.uncommon)
+        self.add_item(self.rare)
+        self.add_item(self.mythic)
+        self.add_item(self.legendary)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            payload = {
+                'autor': interaction.user.display_name,
+                'cliente': self.client_name,
+                'target_type': self.target_type,
+                'bau_origem': self.stock_scope,
+                'source': 'discord',
+                'q_comum': parse_int_input(str(self.common)),
+                'q_incomum': parse_int_input(str(self.uncommon)),
+                'q_rara': parse_int_input(str(self.rare)),
+                'q_mitica': parse_int_input(str(self.mythic)),
+                'q_lendaria': parse_int_input(str(self.legendary)),
+            }
+            await interaction.response.defer(ephemeral=True)
+            await self.cog.handle_sale(interaction, payload)
+        except ValueError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Entrada inválida: {exc}')
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao registrar venda: {exc}')
+
+
+class ClientSelect(discord.ui.Select):
+    def __init__(self, cog: 'FinanceCog', clients: list[str]) -> None:
+        options = [discord.SelectOption(label=name[:100], value=name, description='Família cadastrada no site') for name in clients[:25]]
+        super().__init__(placeholder='Selecione a família para a venda', min_values=1, max_values=1, options=options)
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.cog.send_ephemeral_message(
+            interaction,
+            content='Selecione o baú de onde a droga foi retirada.',
+            view=SaleChestSelectionView(self.cog, self.values[0], 'family'),
+        )
+
+
+class ClientSelectionView(discord.ui.View):
+    def __init__(self, cog: 'FinanceCog', clients: list[str]) -> None:
+        super().__init__(timeout=120)
+        self.add_item(ClientSelect(cog, clients))
+
+
+class SaleChestSelect(discord.ui.Select):
+    def __init__(self, cog: 'FinanceCog', client_name: str, target_type: str = 'family') -> None:
+        options = [
+            discord.SelectOption(label='Favela', value='favela', description='Baú da Favela'),
+            discord.SelectOption(label='Bangalô', value='bangalo', description='Baú do Bangalô'),
+            discord.SelectOption(label='Mansões', value='mansoes', description='Baú das Mansões'),
+            discord.SelectOption(label='Membros', value='members', description='Baú dos Membros'),
+        ]
+        super().__init__(placeholder='Selecione o baú de origem', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.client_name = client_name
+        self.target_type = target_type
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(SaleQuantitiesModal(self.cog, self.client_name, self.values[0], self.target_type))
+
+
+class SaleChestSelectionView(discord.ui.View):
+    def __init__(self, cog: 'FinanceCog', client_name: str, target_type: str = 'family') -> None:
+        super().__init__(timeout=120)
+        self.add_item(SaleChestSelect(cog, client_name, target_type))
+
+
+class SaleTargetSelectionView(discord.ui.View):
+    def __init__(self, cog: 'FinanceCog') -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+
+    @discord.ui.button(label='Família', style=discord.ButtonStyle.primary, emoji='👥')
+    async def family_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            clients = await self.cog.fetch_clients()
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar famílias: {exc}')
+            return
+
+        if not clients:
+            await self.cog.send_ephemeral_message(interaction, content='Nenhuma família cadastrada no site. Cadastre uma família antes de registrar a venda.')
+            return
+
+        view = ClientSelectionView(self.cog, clients)
+        suffix = '' if len(clients) <= 25 else f' Mostrando as 25 primeiras de {len(clients)} famílias.'
+        await self.cog.send_ephemeral_message(interaction, content=f'Selecione a família para continuar.{suffix}', view=view)
+
+    @discord.ui.button(label='Vapo', style=discord.ButtonStyle.success, emoji='💨')
+    async def vapo_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.send_ephemeral_message(
+            interaction,
+            content='Selecione o baú de onde a droga foi retirada para registrar no Vapo.',
+            view=SaleChestSelectionView(self.cog, 'Vapo', 'vapo'),
+        )
+
+
+class DeleteClientSelect(discord.ui.Select):
+    def __init__(self, cog: 'FinanceCog', clients: list[str]) -> None:
+        options = [discord.SelectOption(label=name[:100], value=name, description='Família cadastrada no site') for name in clients[:25]]
+        super().__init__(placeholder='Selecione a família que deseja remover', min_values=1, max_values=1, options=options)
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        client_name = self.values[0]
+        await self.cog.handle_delete_client(interaction, client_name)
+
+
+class DeleteClientSelectionView(discord.ui.View):
+    def __init__(self, cog: 'FinanceCog', clients: list[str]) -> None:
+        super().__init__(timeout=120)
+        self.add_item(DeleteClientSelect(cog, clients))
+
+
+class FinancePanelView(discord.ui.View):
+    def __init__(self, cog: 'FinanceCog') -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        if isinstance(error, discord.NotFound):
+            return
+        if isinstance(error, discord.HTTPException) and getattr(error, 'code', None) in {40060, 10062}:
+            return
+        raise error
+
+    @discord.ui.button(label='Fazer Depósito', style=discord.ButtonStyle.success, emoji='📥', custom_id='finance:deposit')
+    async def deposit_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(TransactionModal(self.cog, 'deposito'))
+
+    @discord.ui.button(label='Realizar Pagamento', style=discord.ButtonStyle.danger, emoji='💸', custom_id='finance:payment')
+    async def payment_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(TransactionModal(self.cog, 'pagamento'))
+
+    @discord.ui.button(label='Registrar Venda', style=discord.ButtonStyle.primary, emoji='🛒', custom_id='finance:sale')
+    async def sale_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        deferred = await self.cog.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        await self.cog.send_ephemeral_message(interaction, content='Selecione o destino da venda.', view=SaleTargetSelectionView(self.cog))
+
+    @discord.ui.button(label='Relatório de Famílias', style=discord.ButtonStyle.secondary, emoji='📈', custom_id='finance:report')
+    async def report_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.handle_report(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao gerar relatório: {exc}')
+
+    @discord.ui.button(label='Cadastrar Cliente', style=discord.ButtonStyle.secondary, emoji='📝', custom_id='finance:panel:create_client', row=1)
+    async def create_client_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(ClientModal(self.cog, 'create'))
+
+    @discord.ui.button(label='Remover Cliente', style=discord.ButtonStyle.secondary, emoji='❌', custom_id='finance:panel:delete_client', row=1)
+    async def delete_client_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        deferred = await self.cog.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        try:
+            clients = await self.cog.fetch_clients()
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar famílias: {exc}')
+            return
+
+        if not clients:
+            await self.cog.send_ephemeral_message(interaction, content='Nenhuma família cadastrada no site para remover.')
+            return
+
+        view = DeleteClientSelectionView(self.cog, clients)
+        suffix = '' if len(clients) <= 25 else f' Mostrando as 25 primeiras de {len(clients)} famílias.'
+        await self.cog.send_ephemeral_message(interaction, content=f'Selecione a família que deseja remover.{suffix}', view=view)
+
+    @discord.ui.button(label='Meta XP', style=discord.ButtonStyle.secondary, emoji='🎯', custom_id='finance:panel:xp_goal', row=1)
+    async def xp_goal_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        deferred = await self.cog.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        try:
+            await self.cog.handle_xp_goal_pending(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar meta semanal de XP: {exc}')
+
+
+class FinanceReportView(discord.ui.View):
+    def __init__(self, cog: 'FinanceCog', pages: list[str]) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.pages = pages
+        self.index = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        self.previous_button.disabled = self.index <= 0
+        self.next_button.disabled = self.index >= len(self.pages) - 1
+
+    def current_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title=f'📈 Ranking e Histórico de Famílias ({self.index + 1}/{len(self.pages)})',
+            description=self.pages[self.index],
+            color=0xB35BD6,
+        )
+
+    @discord.ui.button(label='◀ Anterior', style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.index = max(0, self.index - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='Próximo ▶', style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.index = min(len(self.pages) - 1, self.index + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='Cadastrar Família', style=discord.ButtonStyle.secondary, emoji='📝', custom_id='finance:create_client')
+    async def create_client_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(ClientModal(self.cog, 'create'))
+
+    @discord.ui.button(label='Remover Família', style=discord.ButtonStyle.secondary, emoji='❌', custom_id='finance:delete_client')
+    async def delete_client_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            clients = await self.cog.fetch_clients()
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar famílias: {exc}')
+            return
+
+        if not clients:
+            await self.cog.send_ephemeral_message(interaction, content='Nenhuma família cadastrada no site para remover.')
+            return
+
+        view = DeleteClientSelectionView(self.cog, clients)
+        suffix = '' if len(clients) <= 25 else f' Mostrando as 25 primeiras de {len(clients)} famílias.'
+        await self.cog.send_ephemeral_message(interaction, content=f'Selecione a família que deseja remover.{suffix}', view=view)
+
+
+class XpGoalPendingPlayerSelect(discord.ui.Select):
+    def __init__(self, parent_view: 'XpGoalPendingView') -> None:
+        self.parent_view = parent_view
+        super().__init__(placeholder='Selecione os jogadores desta página', min_values=1, max_values=1, options=[])
+        self.refresh_options()
+
+    def refresh_options(self) -> None:
+        rows = self.parent_view.current_page_selectable_rows()
+        if not rows:
+            self.disabled = True
+            self.options = [discord.SelectOption(label='Nenhum pendente disponível nesta página', value='0')]
+            self.placeholder = 'Sem pendentes selecionáveis nesta página'
+            self.min_values = 1
+            self.max_values = 1
+            return
+
+        options: list[discord.SelectOption] = []
+        for row in rows[:25]:
+            player_id = int(row.get('id', 0) or 0)
+            if player_id <= 0:
+                continue
+
+            name = str(row.get('name', 'Sem nome')).strip() or 'Sem nome'
+            week_xp = float(row.get('week_xp', 0) or 0)
+            missing_xp = float(row.get('missing_xp', 0) or 0)
+            missing_cash = float(row.get('missing_cash', 0) or 0)
+            xp_pending = bool(row.get('is_pending_xp'))
+            cash_pending = bool(row.get('is_pending_cash'))
+            linked = bool(row.get('can_notify'))
+            parts: list[str] = []
+            if xp_pending:
+                parts.append(f'XP faltam {xp_text(missing_xp)}')
+            if cash_pending:
+                parts.append(f'Sujo faltam {money_text(missing_cash)}')
+            if not parts:
+                parts.append(f'XP {xp_text(week_xp)}')
+            description = ' | '.join(parts)
+            if not linked:
+                description += ' | Sem Discord'
+
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=str(player_id),
+                    description=description[:100],
+                    default=player_id in self.parent_view.selected_player_ids,
+                )
+            )
+
+        self.disabled = not bool(options)
+        self.options = options or [discord.SelectOption(label='Nenhum jogador selecionável', value='0')]
+        self.placeholder = f'Selecione até {len(options)} jogador(es) desta página'
+        self.min_values = 1 if options else 1
+        self.max_values = max(1, len(options))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        rows = self.parent_view.current_page_pending_rows()
+        current_page_ids = {
+            int(row.get('id', 0) or 0)
+            for row in rows
+            if int(row.get('id', 0) or 0) > 0 and bool(row.get('can_notify'))
+        }
+
+        self.parent_view.selected_player_ids -= current_page_ids
+        self.parent_view.selected_player_ids |= {
+            int(value)
+            for value in self.values
+            if str(value).isdigit() and int(value) > 0
+        }
+        self.parent_view._sync_buttons()
+        await interaction.response.edit_message(embed=self.parent_view.current_embed(), view=self.parent_view)
+
+
+class XpGoalPendingView(discord.ui.View):
+    def __init__(self, cog: 'FinanceCog', payload: dict[str, Any], pages: list[discord.Embed], names_text: str, notify_text: str, page_size: int = 12) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.payload = payload
+        self.pages = pages
+        self.names_text = names_text
+        self.notify_text = notify_text
+        self.page_size = page_size
+        raw_pending_rows = payload.get('pending_players', []) if isinstance(payload.get('pending_players'), list) else []
+        self.pending_rows = [row for row in raw_pending_rows if isinstance(row, dict)]
+        self.pending_page_count = max(1, (len(self.pending_rows) + self.page_size - 1) // self.page_size) if self.pending_rows else 1
+        self.selected_player_ids: set[int] = set()
+        self.index = 0
+        self.player_select = XpGoalPendingPlayerSelect(self)
+        self.add_item(self.player_select)
+        self._sync_buttons()
+
+    def selectable_pending_rows(self) -> list[dict[str, Any]]:
+        return [row for row in self.pending_rows if bool(row.get('can_notify'))]
+
+    def current_page_pending_rows(self) -> list[dict[str, Any]]:
+        if self.index >= self.pending_page_count:
+            return []
+        start = self.index * self.page_size
+        end = start + self.page_size
+        return self.pending_rows[start:end]
+
+    def current_page_selectable_rows(self) -> list[dict[str, Any]]:
+        return [row for row in self.current_page_pending_rows() if bool(row.get('can_notify'))]
+
+    def selected_pending_rows(self) -> list[dict[str, Any]]:
+        return [
+            row for row in self.pending_rows
+            if int(row.get('id', 0) or 0) in self.selected_player_ids
+        ]
+
+    def build_selection_field_value(self) -> str:
+        total_pending = len(self.pending_rows)
+        total_selectable = len(self.selectable_pending_rows())
+        total_selected = len(self.selected_pending_rows())
+
+        if self.index < self.pending_page_count:
+            page_rows = self.current_page_pending_rows()
+            start = self.index * self.page_size + 1 if page_rows else 0
+            end = self.index * self.page_size + len(page_rows)
+            return (
+                f'Exibindo: {start}-{end} de {total_pending} pendentes\n'
+                f'Selecionáveis no Discord: {total_selectable}\n'
+                f'Selecionados agora: {total_selected}'
+            )
+
+        return (
+            f'Pendentes totais com cálculo: {total_pending}\n'
+            f'Selecionáveis no Discord: {total_selectable}\n'
+            f'Selecionados agora: {total_selected}'
+        )
+
+    def _sync_buttons(self) -> None:
+        self.previous_button.disabled = self.index <= 0
+        self.next_button.disabled = self.index >= len(self.pages) - 1
+        has_selection = bool(self.selected_pending_rows())
+        has_selectable = bool(self.selectable_pending_rows())
+        self.copy_selected_names_button.disabled = not has_selection
+        self.preview_selected_messages_button.disabled = not has_selection
+        self.send_test_to_me_button.disabled = not has_selection
+        self.send_notifications_button.disabled = not has_selection
+        self.resend_notifications_button.disabled = not has_selection
+        self.select_all_pending_button.disabled = not has_selectable
+        self.clear_selection_button.disabled = not has_selection
+        self.player_select.refresh_options()
+
+    def current_embed(self) -> discord.Embed:
+        embed = self.pages[self.index].copy()
+        embed.add_field(name='Seleção Atual', value=self.build_selection_field_value(), inline=False)
+        embed.set_footer(text=f'Página {self.index + 1}/{len(self.pages)}')
+        return embed
+
+    @discord.ui.button(label='◀ Anterior', style=discord.ButtonStyle.secondary, row=1)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.index = max(0, self.index - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='Próximo ▶', style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.index = min(len(self.pages) - 1, self.index + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='Nomes Seleção', style=discord.ButtonStyle.secondary, row=3)
+    async def copy_selected_names_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        selected_rows = self.selected_pending_rows()
+        selected_names = '\n'.join(str(row.get('name', '')).strip() for row in selected_rows if str(row.get('name', '')).strip())
+        await self.cog.send_copyable_text(interaction, 'Nomes selecionados', selected_names)
+
+    @discord.ui.button(label='Selecionar Todos', style=discord.ButtonStyle.success, row=3)
+    async def select_all_pending_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.selected_player_ids = {
+            int(row.get('id', 0) or 0)
+            for row in self.selectable_pending_rows()
+            if int(row.get('id', 0) or 0) > 0
+        }
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='Limpar Sel.', style=discord.ButtonStyle.secondary, row=3)
+    async def clear_selection_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.selected_player_ids.clear()
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='Prévia Seleção', style=discord.ButtonStyle.primary, row=3)
+    async def preview_selected_messages_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        selected_rows = self.selected_pending_rows()
+        if not selected_rows:
+            await self.cog.send_ephemeral_message(interaction, content='Selecione pelo menos um jogador para ver a prévia.')
+            return
+        preview_text = self.cog.build_xp_goal_selected_preview_text(selected_rows)
+        await self.cog.send_copyable_text(interaction, 'Prévia exata do DM', preview_text)
+
+    @discord.ui.button(label='Teste So Pra Mim', style=discord.ButtonStyle.primary, row=4)
+    async def send_test_to_me_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        deferred = await self.cog.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        await self.cog.send_weekly_goal_test_to_self(interaction, self.selected_pending_rows())
+
+    @discord.ui.button(label='Enviar Seleção', style=discord.ButtonStyle.success, row=4)
+    async def send_notifications_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        deferred = await self.cog.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        await self.cog.enqueue_and_process_weekly_goal_notifications(
+            interaction,
+            source='discord',
+            player_ids=[int(row.get('id', 0) or 0) for row in self.selected_pending_rows()],
+            force_resend=False,
+        )
+
+    @discord.ui.button(label='Reenviar Sel.', style=discord.ButtonStyle.danger, row=4)
+    async def resend_notifications_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        deferred = await self.cog.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        await self.cog.enqueue_and_process_weekly_goal_notifications(
+            interaction,
+            source='discord',
+            player_ids=[int(row.get('id', 0) or 0) for row in self.selected_pending_rows()],
+            force_resend=True,
+        )
+
+
+class FinanceCog(commands.Cog):
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self.api = FinanceApiClient()
+        self.guild_object = None
+        self.weekly_goal_audit_cache: dict[str, Any] = {
+            'expires_at': 0.0,
+            'settings': None,
+        }
+        guild_id = int(getattr(config, 'GUILD_ID', 0) or 0)
+        if guild_id > 0:
+            self.guild_object = discord.Object(id=guild_id)
+
+    def audit_log_delete_after(self) -> float | None:
+        raw_value = getattr(config, 'FINANCE_LOG_DELETE_AFTER_SECONDS', 600)
+        try:
+            seconds = float(raw_value)
+        except (TypeError, ValueError):
+            seconds = 600.0
+
+        if seconds <= 0:
+            return None
+
+        return seconds
+
+    def ephemeral_delete_after(self) -> float | None:
+        raw_value = getattr(config, 'FINANCE_EPHEMERAL_DELETE_AFTER_SECONDS', 120)
+        try:
+            seconds = float(raw_value)
+        except (TypeError, ValueError):
+            seconds = 120.0
+
+        if seconds <= 0:
+            return None
+
+        return seconds
+
+    def weekly_goal_audit_user_id(self) -> int:
+        raw_value = getattr(config, 'WEEKLY_GOAL_AUDIT_USER_ID', 0)
+        try:
+            return int(raw_value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def weekly_goal_audit_notify_failures(self) -> bool:
+        return bool(getattr(config, 'WEEKLY_GOAL_AUDIT_NOTIFY_FAILURES', True))
+
+    def has_local_weekly_goal_audit_override(self) -> bool:
+        return self.weekly_goal_audit_user_id() > 0
+
+    async def get_weekly_goal_audit_settings(self, force_refresh: bool = False) -> dict[str, Any]:
+        now = asyncio.get_running_loop().time()
+        cached_settings = self.weekly_goal_audit_cache.get('settings')
+        expires_at = float(self.weekly_goal_audit_cache.get('expires_at') or 0.0)
+        if not force_refresh and isinstance(cached_settings, dict) and expires_at > now:
+            return cached_settings
+
+        fallback = {
+            'audit_dm_enabled': self.weekly_goal_audit_user_id() > 0,
+            'audit_dm_user_id': str(self.weekly_goal_audit_user_id() or '') or None,
+            'audit_dm_notify_failures': self.weekly_goal_audit_notify_failures(),
+        }
+
+        if self.has_local_weekly_goal_audit_override():
+            logger.info(
+                'Config auditoria DM usando override local do bot: enabled=%s user_id=%s notify_failures=%s',
+                fallback['audit_dm_enabled'],
+                fallback['audit_dm_user_id'],
+                fallback['audit_dm_notify_failures'],
+            )
+            settings = fallback
+            self.weekly_goal_audit_cache = {
+                'expires_at': now + 30.0,
+                'settings': settings,
+            }
+            return settings
+
+        try:
+            data = await self.api.get('discord_weekly_goal_notification_schedule.php')
+            schedule = data.get('schedule') if isinstance(data, dict) else None
+            if isinstance(schedule, dict):
+                settings = {
+                    'audit_dm_enabled': bool(schedule.get('audit_dm_enabled')),
+                    'audit_dm_user_id': str(schedule.get('audit_dm_user_id') or '').strip() or None,
+                    'audit_dm_notify_failures': bool(schedule.get('audit_dm_notify_failures', True)),
+                }
+                logger.info(
+                    'Config auditoria DM carregada da API: enabled=%s user_id=%s notify_failures=%s',
+                    settings['audit_dm_enabled'],
+                    settings['audit_dm_user_id'],
+                    settings['audit_dm_notify_failures'],
+                )
+            else:
+                settings = fallback
+                logger.warning('API retornou schedule inválido para auditoria DM; usando fallback local.')
+        except Exception as exc:
+            logger.warning('Falha ao carregar configuração de auditoria DM da meta semanal; usando fallback local: %s', exc)
+            settings = fallback
+
+        self.weekly_goal_audit_cache = {
+            'expires_at': now + 30.0,
+            'settings': settings,
+        }
+        return settings
+
+    async def send_weekly_goal_audit_message(
+        self,
+        *,
+        audit_settings: dict[str, Any] | None = None,
+        status: str,
+        target_discord_user_id: str,
+        player_name: str,
+        message_text: str,
+        delivery_message_id: int | None = None,
+        error_message: str = '',
+    ) -> None:
+        resolved_settings = audit_settings if isinstance(audit_settings, dict) else await self.get_weekly_goal_audit_settings()
+        audit_enabled = bool(resolved_settings.get('audit_dm_enabled'))
+        audit_user_id_raw = str(resolved_settings.get('audit_dm_user_id') or '').strip()
+        audit_notify_failures = bool(resolved_settings.get('audit_dm_notify_failures', True))
+
+        if not audit_enabled or audit_user_id_raw == '':
+            logger.info(
+                'Auditoria DM ignorada: enabled=%s audit_user_id=%s target=%s player=%s',
+                audit_enabled,
+                audit_user_id_raw,
+                target_discord_user_id,
+                player_name,
+            )
+            return
+
+        if status != 'sent' and not audit_notify_failures:
+            return
+
+        try:
+            audit_user_id = int(audit_user_id_raw)
+            audit_user = self.bot.get_user(audit_user_id)
+            if audit_user is None:
+                audit_user = await self.bot.fetch_user(audit_user_id)
+            if audit_user is None:
+                return
+
+            lines = [
+                'Auditoria de DM da meta semanal',
+                f'Status: {status}',
+                f'Player: {player_name or "(sem nome)"}',
+                f'Destinatário Discord ID: {target_discord_user_id}',
+            ]
+            if delivery_message_id is not None:
+                lines.append(f'Message ID Discord: {delivery_message_id}')
+            if error_message:
+                lines.append(f'Erro: {error_message}')
+            if message_text:
+                lines.extend(['', 'Conteúdo enviado:', message_text])
+
+            for chunk in split_message_chunks('\n'.join(lines), limit=1800):
+                await audit_user.send(chunk)
+            logger.info(
+                'Auditoria DM enviada: audit_user_id=%s target=%s player=%s status=%s delivery_message_id=%s',
+                audit_user_id,
+                target_discord_user_id,
+                player_name,
+                status,
+                delivery_message_id,
+            )
+        except Exception as exc:
+            logger.warning('Falha ao enviar auditoria de DM da meta semanal: %s', exc)
+
+    async def send_weekly_goal_audit_summary(
+        self,
+        *,
+        audit_settings: dict[str, Any] | None = None,
+        source: str,
+        summary: dict[str, int],
+        without_discord_players: list[str] | None = None,
+    ) -> None:
+        resolved_settings = audit_settings if isinstance(audit_settings, dict) else await self.get_weekly_goal_audit_settings()
+        audit_enabled = bool(resolved_settings.get('audit_dm_enabled'))
+        audit_user_id_raw = str(resolved_settings.get('audit_dm_user_id') or '').strip()
+
+        if not audit_enabled or audit_user_id_raw == '':
+            return
+
+        try:
+            audit_user_id = int(audit_user_id_raw)
+            audit_user = self.bot.get_user(audit_user_id)
+            if audit_user is None:
+                audit_user = await self.bot.fetch_user(audit_user_id)
+            if audit_user is None:
+                return
+
+            selected_total = int(summary.get('selected_total', 0) or 0)
+            considered_total = selected_total if selected_total > 0 else int(summary.get('pending_total', 0) or 0)
+            lines = [
+                'Resumo da execução da meta semanal',
+                f'Origem: {source}',
+                f'Jogadores considerados: {considered_total}',
+                f'Pendentes abaixo da meta: {int(summary.get("pending_total", 0) or 0)}',
+                f'Acima/na meta: {int(summary.get("met_total", 0) or 0)}',
+                f'Novos na fila: {int(summary.get("queued", 0) or 0)}',
+                f'Atualizados na fila: {int(summary.get("updated", 0) or 0)}',
+                f'Já enviados antes: {int(summary.get("already_sent", 0) or 0)}',
+                f'Sem Discord vinculado: {int(summary.get("without_discord", 0) or 0)}',
+                f'Jobs capturados agora: {int(summary.get("claimed", 0) or 0)}',
+                f'DMs enviadas agora: {int(summary.get("sent", 0) or 0)}',
+                f'Falhas agora: {int(summary.get("failed", 0) or 0)}',
+            ]
+
+            for chunk in split_message_chunks('\n'.join(lines), limit=1800):
+                await audit_user.send(chunk)
+
+            # Send additional DM listing names of players without Discord linked
+            pending_without = [n for n in (without_discord_players or []) if n]
+            if pending_without:
+                names_block = '\n'.join(f'- {n}' for n in pending_without)
+                alert_lines = [
+                    f'⚠️ Atenção: {len(pending_without)} jogador(es) pendente(s) na meta semanal sem Discord vinculado:',
+                    names_block,
+                    '',
+                    'Esses jogadores não receberam a notificação. Configure o Discord deles no painel admin.',
+                ]
+                for chunk in split_message_chunks('\n'.join(alert_lines), limit=1800):
+                    await audit_user.send(chunk)
+
+            logger.info(
+                'Resumo auditoria DM enviado: audit_user_id=%s source=%s sent=%s failed=%s queued=%s updated=%s',
+                audit_user_id,
+                source,
+                summary.get('sent', 0),
+                summary.get('failed', 0),
+                summary.get('queued', 0),
+                summary.get('updated', 0),
+            )
+        except Exception as exc:
+            logger.warning('Falha ao enviar resumo de auditoria da meta semanal: %s', exc)
+
+    async def delete_message_later(self, message: discord.Message | discord.InteractionMessage | discord.WebhookMessage | None, delay: float | None) -> None:
+        if message is None or delay is None:
+            return
+
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    async def send_ephemeral_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        delete_after = self.ephemeral_delete_after()
+        kwargs: dict[str, Any] = {'ephemeral': True}
+
+        if content is not None:
+            kwargs['content'] = content
+        if embed is not None:
+            kwargs['embed'] = embed
+        if view is not None:
+            kwargs['view'] = view
+
+        if interaction.response.is_done():
+            try:
+                message = await interaction.followup.send(wait=True, **kwargs)
+            except discord.NotFound:
+                return
+            except discord.HTTPException as exc:
+                if getattr(exc, 'code', None) in {40060, 10062}:
+                    return
+                raise
+            if delete_after is not None:
+                asyncio.create_task(self.delete_message_later(message, delete_after))
+            return
+
+        try:
+            await interaction.response.send_message(**kwargs)
+        except discord.NotFound:
+            return
+        except discord.HTTPException as exc:
+            if getattr(exc, 'code', None) in {40060, 10062}:
+                return
+            raise
+        if delete_after is not None:
+            try:
+                message = await interaction.original_response()
+            except (discord.NotFound, discord.HTTPException):
+                return
+            asyncio.create_task(self.delete_message_later(message, delete_after))
+
+    async def defer_ephemeral_safely(self, interaction: discord.Interaction, *, thinking: bool = False) -> bool:
+        if interaction.response.is_done():
+            return True
+
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=thinking)
+            return True
+        except discord.NotFound:
+            return False
+        except discord.HTTPException as exc:
+            if getattr(exc, 'code', None) in {40060, 10062}:
+                return False
+            raise
+
+    async def cog_load(self) -> None:
+        self.bot.add_view(FinancePanelView(self))
+        if not self.notification_queue_loop.is_running():
+            self.notification_queue_loop.start()
+
+    async def cog_unload(self) -> None:
+        if self.notification_queue_loop.is_running():
+            self.notification_queue_loop.cancel()
+        await self.api.close()
+
+    def format_family_purchase_summary(self, row: dict[str, Any]) -> str:
+        parts: list[str] = []
+        labels = [
+            ('common_qty', 'Comum'),
+            ('uncommon_qty', 'Incomum'),
+            ('rare_qty', 'Rara'),
+            ('mythic_qty', 'Mítica'),
+            ('legendary_qty', 'Lendária'),
+        ]
+        for field, label in labels:
+            quantity = int(row.get(field, 0) or 0)
+            if quantity > 0:
+                parts.append(f'{quantity}x {label}')
+        return ', '.join(parts) if parts else 'Nenhuma compra registrada'
+
+    def build_family_report_pages(self, rows: list[dict[str, Any]], page_size: int = 5) -> list[str]:
+        if not rows:
+            return ['Ranking das famílias que mais compraram até as que menos compraram:\n\nNenhuma família com compras registradas.\n\nHistórico Geral (Sem limite de tempo)']
+
+        pages: list[str] = []
+        for start in range(0, len(rows), page_size):
+            chunk = rows[start:start + page_size]
+            lines = ['Ranking das famílias que mais compraram até as que menos compraram:', '']
+            for index, row in enumerate(chunk, start=start + 1):
+                family_name = str(row.get('family_name', 'Família')).strip() or 'Família'
+                total_fmt = str(row.get('total_fmt', 'R$ 0,00'))
+                purchases = self.format_family_purchase_summary(row)
+                lines.extend([
+                    f'{index}º - {family_name}',
+                    f'💰 Gasto Total: {total_fmt}',
+                    f'📦 Comprou: {purchases}',
+                    '',
+                ])
+            lines.append('Histórico Geral (Sem limite de tempo)')
+            pages.append('\n'.join(lines).strip())
+        return pages
+
+    def build_xp_goal_embeds(self, payload: dict[str, Any], page_size: int = 12) -> list[discord.Embed]:
+        goal = float(payload.get('goal') or 250)
+        cash_goal = float(payload.get('cash_goal') or 100000)
+        pending_rows = payload.get('pending_players', []) if isinstance(payload.get('pending_players'), list) else []
+        no_comparison_rows = payload.get('no_comparison_players', []) if isinstance(payload.get('no_comparison_players'), list) else []
+
+        embeds: list[discord.Embed] = []
+
+        if pending_rows:
+            for start in range(0, len(pending_rows), page_size):
+                chunk = pending_rows[start:start + page_size]
+                lines: list[str] = []
+                for index, row in enumerate(chunk, start=start + 1):
+                    name = str(row.get('name', 'Sem nome')).strip() or 'Sem nome'
+                    role = str(row.get('role', '') or '').strip()
+                    week_xp = float(row.get('week_xp', 0) or 0)
+                    missing_xp = float(row.get('missing_xp', max(0, goal - week_xp)) or 0)
+                    missing_cash = float(row.get('missing_cash', 0) or 0)
+                    xp_pending = bool(row.get('is_pending_xp'))
+                    cash_pending = bool(row.get('is_pending_cash'))
+                    suffix = f' • {role}' if role else ''
+
+                    reasons: list[str] = []
+                    if xp_pending:
+                        reasons.append(f'XP faltam {xp_text(missing_xp)}')
+                    if cash_pending:
+                        reasons.append(f'Sujo faltam {money_text(missing_cash)}')
+                    if not reasons:
+                        reasons.append('Sem pendência')
+
+                    lines.append(f'{index}. {name}{suffix}\n' + ' | '.join(reasons))
+
+                embed = discord.Embed(
+                    title='🎯 Pendentes Semanais (XP + Sujo)',
+                    description='\n\n'.join(lines),
+                    color=0xDC3545,
+                )
+                embed.add_field(
+                    name='Resumo',
+                    value=(
+                        f'Meta XP: {xp_text(goal)} XP\n'
+                        f'Meta Sujo: {money_text(cash_goal)}\n'
+                        f'Pendentes: {len(pending_rows)}\n'
+                        f'Sem comparação de XP: {len(no_comparison_rows)}'
+                    ),
+                    inline=False,
+                )
+                embed.set_footer(text=f'Página {len(embeds) + 1}')
+                embeds.append(embed)
+        else:
+            embed = discord.Embed(
+                title='🎯 Pendentes Semanais (XP + Sujo)',
+                description='Ninguém está pendente nas metas semanais de XP e dinheiro sujo.',
+                color=0x198754,
+            )
+            embed.add_field(
+                name='Resumo',
+                value=(
+                    f'Meta XP: {xp_text(goal)} XP\n'
+                    f'Meta Sujo: {money_text(cash_goal)}\n'
+                    f'Sem comparação de XP: {len(no_comparison_rows)}'
+                ),
+                inline=False,
+            )
+            embed.set_footer(text='Página 1')
+            embeds.append(embed)
+
+        if no_comparison_rows:
+            for start in range(0, len(no_comparison_rows), page_size):
+                chunk = no_comparison_rows[start:start + page_size]
+                lines = []
+                for index, row in enumerate(chunk, start=start + 1):
+                    name = str(row.get('name', 'Sem nome')).strip() or 'Sem nome'
+                    role = str(row.get('role', '') or '').strip()
+                    suffix = f' • {role}' if role else ''
+                    lines.append(f'{index}. {name}{suffix}')
+
+                embed = discord.Embed(
+                    title='🧾 Sem Comparação de XP',
+                    description='Esses nomes ainda não têm base suficiente para comparar a semana atual.\n\n' + '\n'.join(lines),
+                    color=0x6C757D,
+                )
+                embed.add_field(
+                    name='Resumo',
+                    value=f'Meta semanal: {xp_text(goal)} XP\nPendentes com cálculo: {len(pending_rows)}\nSem comparação: {len(no_comparison_rows)}',
+                    inline=False,
+                )
+                embed.set_footer(text=f'Página {len(embeds) + 1}')
+                embeds.append(embed)
+
+        return embeds
+
+    def build_xp_goal_names_text(self, payload: dict[str, Any]) -> str:
+        pending_rows = payload.get('pending_players', []) if isinstance(payload.get('pending_players'), list) else []
+        names = [str(row.get('name', '')).strip() for row in pending_rows]
+        names = [name for name in names if name]
+        return '\n'.join(names)
+
+    def build_xp_goal_notify_text(self, payload: dict[str, Any]) -> str:
+        goal = float(payload.get('goal') or 250)
+        cash_goal = float(payload.get('cash_goal') or 100000)
+        pending_rows = payload.get('pending_players', []) if isinstance(payload.get('pending_players'), list) else []
+        if not pending_rows:
+            return 'Ninguem esta pendente nas metas semanais de XP e dinheiro sujo.'
+
+        lines = [
+            f'Pendentes das metas semanais (XP {xp_text(goal)} | Sujo {money_text(cash_goal)}):'
+        ]
+        for row in pending_rows:
+            name = str(row.get('name', 'Sem nome')).strip() or 'Sem nome'
+            mention = str(row.get('discord_mention', '') or '').strip()
+            discord_username = str(row.get('discord_username', '') or '').strip()
+            week_xp = float(row.get('week_xp', 0) or 0)
+            missing_xp = float(row.get('missing_xp', max(0, goal - week_xp)) or 0)
+            missing_cash = float(row.get('missing_cash', 0) or 0)
+            xp_pending = bool(row.get('is_pending_xp'))
+            cash_pending = bool(row.get('is_pending_cash'))
+            if mention:
+                target = f'{mention} ({name})'
+            elif discord_username:
+                target = f'{discord_username} ({name})'
+            else:
+                target = name
+
+            reasons: list[str] = []
+            if xp_pending:
+                reasons.append(f'Faltam XP: {xp_text(missing_xp)}')
+            if cash_pending:
+                reasons.append(f'Falta Sujo: {money_text(missing_cash)}')
+            if not reasons:
+                reasons.append('Sem pendencia')
+
+            lines.append(f'- {target} | ' + ' | '.join(reasons))
+        return '\n'.join(lines)
+
+    def build_xp_goal_selected_preview_text(self, rows: list[dict[str, Any]]) -> str:
+        previews = [str(row.get('message_preview', '')).strip() for row in rows if str(row.get('message_preview', '')).strip()]
+        return '\n\n----------------\n\n'.join(previews)
+
+    async def send_weekly_goal_test_to_self(self, interaction: discord.Interaction, rows: list[dict[str, Any]]) -> None:
+        selected_rows = [row for row in rows if isinstance(row, dict)]
+        if not selected_rows:
+            await self.send_ephemeral_message(interaction, content='Selecione pelo menos um jogador para enviar o teste.')
+            return
+
+        preview_chunks: list[str] = []
+        for row in selected_rows:
+            player_name = str(row.get('name', 'Sem nome')).strip() or 'Sem nome'
+            message_preview = str(row.get('message_preview', '')).strip()
+            if message_preview == '':
+                continue
+            preview_chunks.append(f'[TESTE PARA VOCÊ] Player original: {player_name}\n\n{message_preview}')
+
+        if not preview_chunks:
+            await self.send_ephemeral_message(interaction, content='A seleção atual não possui nenhuma mensagem de teste disponível.')
+            return
+
+        sent = 0
+        for block in preview_chunks:
+            for chunk in split_message_chunks(block, limit=1800):
+                await interaction.user.send(chunk)
+                sent += 1
+
+        await self.send_ephemeral_message(
+            interaction,
+            content=(
+                f'Teste enviado para a sua DM.\n'
+                f'Jogadores na seleção: {len(selected_rows)}\n'
+                f'Mensagens enviadas para você: {sent}'
+            ),
+        )
+
+    def panel_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title='🏦 COFRE E BANCO - LA FIRMA',
+            description='**Acesso Restrito à Liderança.**\n\nUtilize os botões abaixo para gerenciar as finanças e as famílias da sua facção.',
+            color=0x6EA8FE,
+        )
+        embed.set_footer(text='Financeiro LA FIRMA')
+        return embed
+
+    def panel_view(self) -> discord.ui.View:
+        return FinancePanelView(self)
+
+    def admin_panel_url(self, path: str) -> str:
+        base_url = self.api.base_url
+        if base_url.endswith('/api'):
+            return base_url[:-4] + '/' + path.lstrip('/')
+        return base_url.rstrip('/') + '/' + path.lstrip('/')
+
+    async def send_panel(self, destination: discord.abc.Messageable) -> None:
+        await destination.send(embed=self.panel_embed(), view=self.panel_view())
+
+    async def publish_panel(self, interaction: discord.Interaction, configured_channel_id: int) -> str:
+        fallback_channel = interaction.channel
+        if configured_channel_id <= 0:
+            if fallback_channel is None:
+                raise FinanceApiError('Canal atual indisponível para enviar o painel.')
+            await self.send_panel(fallback_channel)
+            return 'current'
+
+        try:
+            channel = self.bot.get_channel(configured_channel_id) or await self.bot.fetch_channel(configured_channel_id)
+            await self.send_panel(channel)
+            return 'configured'
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            if fallback_channel is None:
+                raise FinanceApiError(
+                    'O bot não conseguiu acessar o canal configurado do painel. Verifique o ID e as permissões de Ver canal e Enviar mensagens.'
+                )
+
+            await self.send_panel(fallback_channel)
+            return 'fallback'
+
+    async def audit_destination(self, interaction: discord.Interaction) -> discord.abc.Messageable | None:
+        channel_id = int(getattr(config, 'LOG_CHANNEL_ID', 0) or 0)
+        if channel_id > 0:
+            return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+        return interaction.channel
+
+    async def send_audit_log(self, interaction: discord.Interaction, title: str, color: int, fields: list[tuple[str, str, bool]]) -> None:
+        destination = await self.audit_destination(interaction)
+        if destination is None:
+            return
+
+        embed = discord.Embed(title=title, color=color)
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        for name, value, inline in fields:
+            embed.add_field(name=name, value=value, inline=inline)
+        embed.set_footer(text='Gravado no site e auditado no Discord')
+        await destination.send(embed=embed, delete_after=self.audit_log_delete_after())
+
+    async def send_copyable_text(self, interaction: discord.Interaction, title: str, raw_text: str) -> None:
+        text = raw_text.strip()
+        if not text:
+            await self.send_ephemeral_message(interaction, content='Nenhum texto disponível para copiar.')
+            return
+
+        chunks = split_message_chunks(text)
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            header = f'{title}' if total == 1 else f'{title} ({index}/{total})'
+            await self.send_ephemeral_message(interaction, content=f'{header}:\n```text\n{chunk}\n```')
+
+    async def enqueue_weekly_goal_notifications(
+        self,
+        source: str = 'discord',
+        force_resend: bool = False,
+        player_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            'source': source,
+            'force_resend': force_resend,
+            'player_ids': player_ids or [],
+        }
+        data = await self.api.post('discord_weekly_goal_notifications_enqueue.php', payload)
+        result = data.get('result')
+        if not isinstance(result, dict):
+            raise FinanceApiError('Resposta inválida ao enfileirar notificações da meta semanal.')
+        return result
+
+    async def claim_weekly_goal_notification_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        data = await self.api.get(f'discord_weekly_goal_notifications_claim.php?limit={int(limit)}')
+        jobs = data.get('jobs', [])
+        if not isinstance(jobs, list):
+            raise FinanceApiError('Resposta inválida ao buscar fila de notificações da meta semanal.')
+        return [job for job in jobs if isinstance(job, dict)]
+
+    async def complete_weekly_goal_notification_jobs(self, results: list[dict[str, Any]]) -> None:
+        if not results:
+            return
+        await self.api.post('discord_weekly_goal_notifications_complete.php', {'results': results})
+
+    async def claim_due_weekly_goal_notification_schedule(self) -> dict[str, Any]:
+        data = await self.api.post('discord_weekly_goal_notification_schedule_claim.php', {})
+        claim = data.get('claim')
+        if not isinstance(claim, dict):
+            raise FinanceApiError('Resposta inválida ao consultar agenda automática da meta semanal.')
+        return claim
+
+    async def send_weekly_goal_notification_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        audit_settings = await self.get_weekly_goal_audit_settings()
+        job_id = int(job.get('id', 0) or 0)
+        discord_user_id = str(job.get('discord_user_id', '') or '').strip()
+        player_name = str(job.get('player_name', '') or '').strip()
+        message_text = str(job.get('message_text', '') or '').strip()
+        if job_id <= 0 or discord_user_id == '':
+            return {'job_id': job_id, 'status': 'failed', 'error_message': 'Job inválido para envio.'}
+
+        try:
+            user = self.bot.get_user(int(discord_user_id))
+            if user is None:
+                user = await self.bot.fetch_user(int(discord_user_id))
+            sent_message = await user.send(message_text)
+            await self.send_weekly_goal_audit_message(
+                audit_settings=audit_settings,
+                status='sent',
+                target_discord_user_id=discord_user_id,
+                player_name=player_name,
+                message_text=message_text,
+                delivery_message_id=int(sent_message.id),
+            )
+            return {'job_id': job_id, 'status': 'sent', 'delivery_message_id': str(sent_message.id)}
+        except (discord.NotFound, discord.Forbidden) as exc:
+            error_message = str(exc)
+            await self.send_weekly_goal_audit_message(
+                audit_settings=audit_settings,
+                status='failed',
+                target_discord_user_id=discord_user_id,
+                player_name=player_name,
+                message_text=message_text,
+                error_message=error_message,
+            )
+            return {'job_id': job_id, 'status': 'failed', 'error_message': error_message}
+        except discord.HTTPException as exc:
+            error_message = f'HTTPException: {exc}'
+            await self.send_weekly_goal_audit_message(
+                audit_settings=audit_settings,
+                status='failed',
+                target_discord_user_id=discord_user_id,
+                player_name=player_name,
+                message_text=message_text,
+                error_message=error_message,
+            )
+            return {'job_id': job_id, 'status': 'failed', 'error_message': error_message}
+        except Exception as exc:
+            error_message = str(exc)
+            await self.send_weekly_goal_audit_message(
+                audit_settings=audit_settings,
+                status='failed',
+                target_discord_user_id=discord_user_id,
+                player_name=player_name,
+                message_text=message_text,
+                error_message=error_message,
+            )
+            return {'job_id': job_id, 'status': 'failed', 'error_message': error_message}
+
+    async def process_weekly_goal_notification_queue(self, limit: int = 20) -> dict[str, int]:
+        jobs = await self.claim_weekly_goal_notification_jobs(limit=limit)
+        if not jobs:
+            return {'claimed': 0, 'sent': 0, 'failed': 0}
+
+        results: list[dict[str, Any]] = []
+        sent = 0
+        failed = 0
+        for job in jobs:
+            result = await self.send_weekly_goal_notification_job(job)
+            results.append(result)
+            if result.get('status') == 'sent':
+                sent += 1
+            else:
+                failed += 1
+
+        await self.complete_weekly_goal_notification_jobs(results)
+        return {'claimed': len(jobs), 'sent': sent, 'failed': failed}
+
+    async def run_due_automatic_weekly_goal_notifications(self) -> dict[str, Any] | None:
+        claim = await self.claim_due_weekly_goal_notification_schedule()
+        if not bool(claim.get('should_run')):
+            return None
+
+        return await self.enqueue_and_process_weekly_goal_notifications(
+            interaction=None,
+            source='auto',
+            player_ids=None,
+            force_resend=bool(claim.get('force_resend')),
+        )
+
+    async def enqueue_and_process_weekly_goal_notifications(
+        self,
+        interaction: discord.Interaction | None = None,
+        source: str = 'discord',
+        player_ids: list[int] | None = None,
+        force_resend: bool = False,
+    ) -> dict[str, int]:
+        audit_settings = await self.get_weekly_goal_audit_settings()
+        enqueue_result = await self.enqueue_weekly_goal_notifications(
+            source=source,
+            force_resend=force_resend,
+            player_ids=player_ids,
+        )
+        process_result = await self.process_weekly_goal_notification_queue(limit=50)
+        without_discord_players: list[str] = [
+            str(n) for n in (enqueue_result.get('without_discord_players') or []) if str(n).strip()
+        ]
+        summary = {
+            'pending_total': int(enqueue_result.get('pending_total', 0) or 0),
+            'met_total': int(enqueue_result.get('met_total', 0) or 0),
+            'queued': int(enqueue_result.get('queued', 0) or 0),
+            'updated': int(enqueue_result.get('updated', 0) or 0),
+            'already_sent': int(enqueue_result.get('already_sent', 0) or 0),
+            'without_discord': int(enqueue_result.get('without_discord', 0) or 0),
+            'selected_total': int(enqueue_result.get('selected_total', 0) or 0),
+            'claimed': int(process_result.get('claimed', 0) or 0),
+            'sent': int(process_result.get('sent', 0) or 0),
+            'failed': int(process_result.get('failed', 0) or 0),
+        }
+        await self.send_weekly_goal_audit_summary(
+            audit_settings=audit_settings,
+            source=source,
+            summary=summary,
+            without_discord_players=without_discord_players,
+        )
+        if interaction is not None:
+            await self.send_ephemeral_message(
+                interaction,
+                content=(
+                    'Avisos semanais processados (XP + Sujo).\n'
+                    f'Pendentes nas metas: {summary["pending_total"]}\n'
+                    f'Selecionados: {summary["selected_total"]}\n'
+                    f'Novos na fila: {summary["queued"]}\n'
+                    f'Atualizados na fila: {summary["updated"]}\n'
+                    f'Já enviados antes: {summary["already_sent"]}\n'
+                    f'Sem Discord vinculado: {summary["without_discord"]}\n'
+                    f'Capturados da fila: {summary["claimed"]}\n'
+                    f'Enviados agora: {summary["sent"]}\n'
+                    f'Falhas agora: {summary["failed"]}'
+                ),
+            )
+        return summary
+
+    @tasks.loop(seconds=30)
+    async def notification_queue_loop(self) -> None:
+        try:
+            await self.bot.wait_until_ready()
+            await self.run_due_automatic_weekly_goal_notifications()
+            await self.process_weekly_goal_notification_queue(limit=20)
+            # Reset backoff on success
+            self._nq_backoff = 0
+        except FinanceApiError as exc:
+            self._nq_backoff = min(getattr(self, '_nq_backoff', 0) + 1, 20)
+            wait = min(30 * (2 ** self._nq_backoff), 600)
+            logger.warning('Loop automático da meta semanal adiado (retry em %ds): %s', wait, exc)
+            await asyncio.sleep(wait)
+        except Exception:
+            logger.exception('Falha no loop automático da meta semanal.')
+
+    async def handle_transaction(self, interaction: discord.Interaction, tx_type: str, valor: float, motivo: str) -> None:
+        author = interaction.user.display_name
+        payload = {
+            'tipo': tx_type,
+            'autor': author,
+            'valor': valor,
+            'motivo': motivo,
+        }
+        await self.api.post('finance_save_transaction.php', payload)
+        await self.send_ephemeral_message(interaction, content=f'{tx_type.title()} registrado: {money_text(valor)}')
+        await self.send_audit_log(
+            interaction,
+            f'{tx_type.title()} registrado',
+            0x198754 if tx_type == 'deposito' else 0xDC3545,
+            [
+                ('Valor', money_text(valor), True),
+                ('Motivo', motivo, False),
+                ('Origem', 'Discord + Site', True),
+            ],
+        )
+
+    async def handle_create_client(self, interaction: discord.Interaction, nome: str) -> None:
+        result = await self.api.post('finance_create_client.php', {'nome': nome.strip()})
+        if result.get('status') == 'duplicado':
+            await self.send_ephemeral_message(interaction, content='Essa família já existe no site.')
+            return
+        await self.send_ephemeral_message(interaction, content=f'Família cadastrada: {nome}')
+        await self.send_audit_log(interaction, 'Família cadastrada', 0x0D6EFD, [('Família', nome, False), ('Origem', 'Discord + Site', True)])
+
+    async def handle_delete_client(self, interaction: discord.Interaction, nome: str) -> None:
+        await self.api.post('finance_delete_client.php', {'nome': nome.strip()})
+        await self.send_ephemeral_message(interaction, content=f'Família removida: {nome}')
+        await self.send_audit_log(interaction, 'Família removida', 0x6C757D, [('Família', nome, False), ('Origem', 'Discord + Site', True)])
+
+    async def handle_sale(self, interaction: discord.Interaction, payload: dict[str, Any]) -> None:
+        total = (payload['q_comum'] * 45) + (payload['q_incomum'] * 50) + (payload['q_rara'] * 55) + (payload['q_mitica'] * 60) + (payload['q_lendaria'] * 65)
+        if total <= 0:
+            await self.send_ephemeral_message(interaction, content='Informe pelo menos um item para a venda.')
+            return
+
+        await self.api.post('finance_register_sale.php', payload)
+        scope_label = SALE_SCOPE_LABELS.get(str(payload.get('bau_origem', 'favela')), 'Favela')
+        target_label = 'Vapo' if str(payload.get('target_type', 'family')) == 'vapo' else 'Família'
+        await self.send_ephemeral_message(interaction, content=f'Venda registrada para {payload["cliente"]}: {money_text(total)} | Baú: {scope_label}')
+        await self.send_audit_log(
+            interaction,
+            'Venda registrada',
+            0x6F42C1,
+            [
+                ('Destino', payload['cliente'], True),
+                ('Tipo', target_label, True),
+                ('Baú', scope_label, True),
+                ('Total', money_text(total), True),
+                ('Itens', f"C {payload['q_comum']} | I {payload['q_incomum']} | R {payload['q_rara']} | M {payload['q_mitica']} | L {payload['q_lendaria']}", False),
+                ('Origem', 'Discord + Site', True),
+            ],
+        )
+
+    async def fetch_clients(self) -> list[str]:
+        data = await self.api.get('finance_clients_list.php')
+        clients = data.get('clients', [])
+        if not isinstance(clients, list):
+            raise FinanceApiError('Lista de famílias inválida retornada pela API.')
+        return [str(client).strip() for client in clients if str(client).strip()]
+
+    async def handle_report(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        ranking = None
+        warnings: list[str] = []
+
+        try:
+            ranking = await self.api.get('finance_clients_ranking.php')
+        except FinanceApiError as exc:
+            warnings.append(f'Ranking indisponível: {exc}')
+
+        if ranking is None:
+            raise FinanceApiError('O ranking de famílias não respondeu corretamente.')
+
+        rows = ranking.get('rows', []) if isinstance(ranking.get('rows'), list) else []
+        pages = self.build_family_report_pages(rows)
+        if warnings:
+            pages[0] += '\n\nAvisos:\n' + '\n'.join(warnings[:3])
+
+        view = FinanceReportView(self, pages)
+        await self.send_ephemeral_message(interaction, embed=view.current_embed(), view=view)
+
+    async def handle_xp_goal_pending(self, interaction: discord.Interaction) -> None:
+        data = await self.api.get('xp_weekly_goal_status.php')
+        embeds = self.build_xp_goal_embeds(data)
+        names_text = self.build_xp_goal_names_text(data)
+        notify_text = self.build_xp_goal_notify_text(data)
+        view = XpGoalPendingView(self, data, embeds, names_text, notify_text)
+        await self.send_ephemeral_message(interaction, embed=embeds[0], view=view)
+
+    async def resolve_matching_guild(self, interaction: discord.Interaction) -> discord.Guild:
+        if interaction.guild is not None:
+            return interaction.guild
+
+        guild_id = int(getattr(config, 'GUILD_ID', 0) or 0)
+        if guild_id <= 0:
+            raise FinanceApiError('Defina GUILD_ID no config.py para sincronizar sugestões fora de um servidor.')
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            guild = await self.bot.fetch_guild(guild_id)
+        if guild is None:
+            raise FinanceApiError('Não foi possível localizar o servidor configurado para sincronizar sugestões.')
+        return guild
+
+    async def fetch_guild_members_for_matching(self, guild: discord.Guild) -> list[dict[str, Any]]:
+        members: list[dict[str, Any]] = []
+        if guild.chunked and guild.members:
+            iterable = guild.members
+        else:
+            try:
+                await guild.chunk(cache=True)
+                iterable = guild.members
+            except (discord.Forbidden, discord.HTTPException):
+                iterable = [member async for member in guild.fetch_members(limit=None)]
+
+        for member in iterable:
+            if member.bot:
+                continue
+            members.append({
+                'id' : str(member.id),
+                'username': str(member.name),
+                'global_name': str(getattr(member, 'global_name', '') or ''),
+                'display_name': str(member.display_name),
+                'bot': bool(member.bot),
+            })
+
+        return members
+
+    @app_commands.command(name='listar_sem_discord', description='Lista todos os jogadores do ranking que não têm Discord vinculado no site.')
+    @app_commands.default_permissions(administrator=True)
+    async def listar_sem_discord(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            data = await self.api.get('players_without_discord.php')
+            players: list[dict[str, Any]] = data.get('players') or []
+            total = int(data.get('total', len(players)))
+
+            if not players:
+                await self.send_ephemeral_message(interaction, content='✅ Todos os jogadores do ranking têm Discord vinculado.')
+                return
+
+            names_block = '\n'.join(f'- {p["name"]}' for p in players if p.get('name'))
+            text = (
+                f'⚠️ {total} jogador(es) sem Discord vinculado:\n'
+                f'{names_block}\n\n'
+                'Configure o Discord deles no painel admin (Admin > Players ou Admin > Discord Link).'
+            )
+            for chunk in split_message_chunks(text, limit=1900):
+                await self.send_ephemeral_message(interaction, content=chunk)
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao buscar jogadores sem Discord: {exc}')
+
+    @app_commands.command(name='sincronizar_vinculos_xp', description='Gera sugestões automáticas de vínculo entre ranking XP e membros do Discord.')
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(substituir_vinculos_confirmados='Se marcado, recalcula até players que já têm vínculo confirmado.', score_minimo='Score mínimo da sugestão automática.')
+    async def sincronizar_vinculos_xp(
+        self,
+        interaction: discord.Interaction,
+        substituir_vinculos_confirmados: bool = False,
+        score_minimo: app_commands.Range[int, 70, 100] = 88,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            guild = await self.resolve_matching_guild(interaction)
+            members = await self.fetch_guild_members_for_matching(guild)
+            if not members:
+                raise FinanceApiError('Nenhum membro elegível foi encontrado no servidor para gerar sugestões.')
+
+            payload = {
+                'members': members,
+                'replace_existing_confirmed': bool(substituir_vinculos_confirmados),
+                'minimum_score': int(score_minimo),
+            }
+            data = await self.api.post('discord_player_link_suggestions_sync.php', payload)
+            result = data.get('result', {}) if isinstance(data.get('result'), dict) else {}
+            review_url = self.admin_panel_url('admin_discord_link_suggestions.php')
+            await self.send_ephemeral_message(
+                interaction,
+                content=(
+                    'Sugestões sincronizadas.\n'
+                    f'Players analisados: {result.get("players_scanned", 0)}\n'
+                    f'Membros analisados: {result.get("members_scanned", 0)}\n'
+                    f'Sugestões atualizadas: {result.get("suggestions_updated", 0)}\n'
+                    f'Sugestões limpas: {result.get("suggestions_cleared", 0)}\n'
+                    f'Score mínimo: {result.get("minimum_score", score_minimo)}\n'
+                    f'Revise em: {review_url}'
+                ),
+            )
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao sincronizar sugestões de vínculo: {exc}')
+
+    @app_commands.command(name='painelbanco', description='Envia a embed com o link do painel financeiro.')
+    async def painel_banco(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        channel_id = int(getattr(config, 'PANEL_CHANNEL_ID', 0) or 0)
+        destination = await self.publish_panel(interaction, channel_id)
+
+        if destination == 'configured':
+            await self.send_ephemeral_message(interaction, content='Painel enviado no canal configurado.')
+            return
+
+        if destination == 'fallback' and channel_id > 0:
+            await self.send_ephemeral_message(
+                interaction,
+                content='O bot não conseguiu acessar o canal configurado em PANEL_CHANNEL_ID. Enviei o painel neste canal. Verifique o ID e as permissões do bot.',
+            )
+            return
+
+        await self.send_ephemeral_message(interaction, content='Painel enviado neste canal.')
+
+    @app_commands.command(name='cliente_adicionar', description='Cadastra uma família no site para uso no financeiro.')
+    @app_commands.describe(nome='Nome da família')
+    async def cadastrar_cliente(self, interaction: discord.Interaction, nome: str) -> None:
+        try:
+            await self.handle_create_client(interaction, nome)
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao cadastrar família: {exc}')
+
+    @app_commands.command(name='deposito', description='Registra um depósito no financeiro do site.')
+    @app_commands.describe(valor='Valor do depósito', motivo='Descrição do depósito')
+    async def deposito(self, interaction: discord.Interaction, valor: app_commands.Range[float, 0.01], motivo: str) -> None:
+        try:
+            await self.handle_transaction(interaction, 'deposito', float(valor), motivo.strip())
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao registrar depósito: {exc}')
+
+    @app_commands.command(name='saque', description='Registra um saque no financeiro do site.')
+    @app_commands.describe(valor='Valor do saque', motivo='Descrição do saque')
+    async def saque(self, interaction: discord.Interaction, valor: app_commands.Range[float, 0.01], motivo: str) -> None:
+        try:
+            await self.handle_transaction(interaction, 'saque', float(valor), motivo.strip())
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao registrar saque: {exc}')
+
+    @app_commands.command(name='pagamento', description='Registra um pagamento no financeiro do site.')
+    @app_commands.describe(valor='Valor do pagamento', motivo='Descrição do pagamento')
+    async def pagamento(self, interaction: discord.Interaction, valor: app_commands.Range[float, 0.01], motivo: str) -> None:
+        try:
+            await self.handle_transaction(interaction, 'pagamento', float(valor), motivo.strip())
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao registrar pagamento: {exc}')
+
+    @app_commands.command(name='venda', description='Registra uma venda para família ou Vapo no painel financeiro.')
+    @app_commands.describe(
+        cliente='Família cadastrada no site ou Vapo',
+        destino='Escolha se a venda é para família ou Vapo',
+        bau_origem='Baú de onde a droga foi retirada',
+        comum='Quantidade de comum',
+        incomum='Quantidade de incomum',
+        rara='Quantidade de rara',
+        mitica='Quantidade de mítica',
+        lendaria='Quantidade de lendária',
+    )
+    @app_commands.choices(
+        destino=[
+            app_commands.Choice(name='Família', value='family'),
+            app_commands.Choice(name='Vapo', value='vapo'),
+        ],
+        bau_origem=[
+            app_commands.Choice(name='Favela', value='favela'),
+            app_commands.Choice(name='Bangalô', value='bangalo'),
+            app_commands.Choice(name='Mansões', value='mansoes'),
+            app_commands.Choice(name='Membros', value='members'),
+        ]
+    )
+    async def venda(
+        self,
+        interaction: discord.Interaction,
+        cliente: str,
+        destino: app_commands.Choice[str],
+        bau_origem: app_commands.Choice[str],
+        comum: app_commands.Range[int, 0] = 0,
+        incomum: app_commands.Range[int, 0] = 0,
+        rara: app_commands.Range[int, 0] = 0,
+        mitica: app_commands.Range[int, 0] = 0,
+        lendaria: app_commands.Range[int, 0] = 0,
+    ) -> None:
+        payload = {
+            'autor': interaction.user.display_name,
+            'cliente': 'Vapo' if destino.value == 'vapo' else cliente.strip(),
+            'target_type': destino.value,
+            'bau_origem': bau_origem.value,
+            'source': 'discord',
+            'q_comum': int(comum),
+            'q_incomum': int(incomum),
+            'q_rara': int(rara),
+            'q_mitica': int(mitica),
+            'q_lendaria': int(lendaria),
+        }
+
+        try:
+            await self.handle_sale(interaction, payload)
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao registrar venda: {exc}')
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(FinanceCog(bot))

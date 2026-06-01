@@ -1,0 +1,1374 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Any
+from urllib.parse import urlencode
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+import config
+from services.finance_api import FinanceApiClient, FinanceApiError
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def role_ids_from_config(name: str) -> set[int]:
+    values = getattr(config, name, []) or []
+    parsed: set[int] = set()
+    for value in values:
+        try:
+            role_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if role_id > 0:
+            parsed.add(role_id)
+    return parsed
+
+
+def has_any_role(member: discord.Member, role_ids: set[int]) -> bool:
+    if not role_ids:
+        return False
+    return any(role.id in role_ids for role in member.roles)
+
+
+def vehicle_status_emoji(status: str) -> str:
+    mapping = {
+        'available': '✅',
+        'checked_out': '🚗',
+        'detained': '🚨',
+        'inactive': '⛔',
+    }
+    return mapping.get(status, '•')
+
+
+def bool_from_text(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in {'1', 'sim', 's', 'true', 'yes', 'y'}
+
+
+def format_vehicle_timestamp(value: Any) -> str:
+    raw = str(value or '').strip()
+    if raw == '':
+        return ''
+
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f'):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            return parsed.strftime('%d/%m/%Y %H:%M')
+        except ValueError:
+            continue
+
+    return raw
+
+
+def format_vexp_date(value: Any) -> str:
+    raw = str(value or '').strip()
+    if raw == '':
+        return ''
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y'):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            return parsed.strftime('%d/%m/%Y')
+        except ValueError:
+            continue
+    return raw
+
+
+def build_vexp_notification_message(row: dict[str, Any], reminder_days: int, *, simulation: bool = False) -> str:
+    vehicle_name = str(row.get('vehicle_name', 'Veículo')).strip() or 'Veículo'
+    duration_days = int(row.get('duration_days', 0) or 0)
+    purchased_at = format_vexp_date(row.get('purchased_at')) or 'Não informado'
+    expires_at = format_vexp_date(row.get('expires_at')) or 'Não informado'
+
+    if reminder_days <= 0:
+        headline = 'vence hoje'
+    elif reminder_days == 1:
+        headline = 'vence amanhã'
+    else:
+        headline = f'vence em {reminder_days} dias'
+
+    lines = [
+        'Aviso de vencimento de veículo.',
+        '',
+        f'Veículo: {vehicle_name}',
+        f'Comprado em: {purchased_at}',
+        f'Duração: {duration_days} dias',
+        f'Vencimento: {expires_at}',
+        f'Status: {headline}.',
+        '',
+        'Renove o registro do veículo para evitar perder o acesso.',
+    ]
+    if simulation:
+        lines.insert(0, '[SIMULAÇÃO]')
+    return '\n'.join(lines)
+
+
+class VehicleRegisterModal(discord.ui.Modal):
+    def __init__(self, cog: 'VehicleCog') -> None:
+        super().__init__(title='Cadastrar Veículo')
+        self.cog = cog
+        self.vehicle_name = discord.ui.TextInput(
+            label='Nome/modelo do veículo',
+            placeholder='Ex: Sultan RS, Banshee, Sprinter',
+            required=True,
+            max_length=191,
+        )
+        self.vehicle_plate = discord.ui.TextInput(
+            label='Placa do veículo',
+            placeholder='Ex: ABC1D23 ou ABC-1234',
+            required=True,
+            max_length=16,
+        )
+        self.add_item(self.vehicle_name)
+        self.add_item(self.vehicle_plate)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+            await self.cog.register_vehicle(
+                interaction,
+                str(self.vehicle_name).strip(),
+                str(self.vehicle_plate).strip(),
+            )
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao cadastrar veículo: {exc}')
+
+
+class VehicleReturnModal(discord.ui.Modal):
+    def __init__(self, cog: 'VehicleCog', vehicle_row: dict[str, Any], detained: bool) -> None:
+        super().__init__(title='Devolver Veículo')
+        self.cog = cog
+        self.vehicle_row = vehicle_row
+        self.detained = detained
+        self.note = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: tanque vazio, sem danos, detido na praça',
+            required=False,
+            max_length=255,
+            style=discord.TextStyle.long,
+        )
+        self.add_item(self.note)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+            await self.cog.return_vehicle(interaction, self.vehicle_row, self.detained, str(self.note).strip())
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao devolver veículo: {exc}')
+
+
+class VehicleReturnDetainedSelect(discord.ui.Select):
+    def __init__(self, view: 'VehicleReturnDecisionView') -> None:
+        self.decision_view = view
+        options = [
+            discord.SelectOption(label='Não', value='no', description='O veículo voltou normalmente.', default=True),
+            discord.SelectOption(label='Sim', value='yes', description='O veículo foi detido na devolução.', default=False),
+        ]
+        super().__init__(
+            placeholder='Selecione se o veículo foi detido',
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.decision_view.detained = self.values[0] == 'yes'
+        for option in self.options:
+            option.default = option.value == self.values[0]
+        await interaction.response.edit_message(view=self.decision_view)
+
+
+class VehicleReturnDecisionView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog', vehicle_row: dict[str, Any]) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.vehicle_row = vehicle_row
+        self.detained = False
+        self.add_item(VehicleReturnDetainedSelect(self))
+
+    @discord.ui.button(label='Continuar', style=discord.ButtonStyle.primary, emoji='↩️')
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(VehicleReturnModal(self.cog, self.vehicle_row, self.detained))
+
+
+class VehicleDeactivateConfirmView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog', vehicle_row: dict[str, Any]) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.vehicle_row = vehicle_row
+
+    @discord.ui.button(label='Confirmar Remoção', style=discord.ButtonStyle.danger, emoji='🗑️')
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self.cog.deactivate_vehicle(interaction, self.vehicle_row)
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content='Remoção cancelada.', view=None)
+
+
+class VehicleSelect(discord.ui.Select):
+    def __init__(self, cog: 'VehicleCog', rows: list[dict[str, Any]], mode: str) -> None:
+        self.cog = cog
+        self.rows = rows
+        self.mode = mode
+        options: list[discord.SelectOption] = []
+
+        for row in rows[:25]:
+            vehicle_id = int(row.get('id', 0) or 0)
+            if vehicle_id <= 0:
+                continue
+            name = str(row.get('name', 'Veículo')).strip() or 'Veículo'
+            plate = str(row.get('plate', '') or '').strip()
+            status = str(row.get('status_label', row.get('status', ''))).strip()
+            description = f'Placa: {plate}' if plate else status
+            if mode == 'checkout':
+                last_holder = str(row.get('last_holder_name', '') or '').strip()
+                if last_holder:
+                    description = f'Placa: {plate} | Último: {last_holder}' if plate else f'Último responsável: {last_holder}'
+            elif mode == 'return':
+                current_holder = str(row.get('current_holder_name', '') or '').strip()
+                if current_holder:
+                    description = f'Placa: {plate} | Em posse de: {current_holder}' if plate else f'Em posse de: {current_holder}'
+            elif mode == 'release':
+                last_holder = str(row.get('last_holder_name', '') or '').strip()
+                if last_holder:
+                    description = f'Placa: {plate} | Último: {last_holder}' if plate else f'Último responsável: {last_holder}'
+            elif mode == 'deactivate':
+                last_holder = str(row.get('last_holder_name', '') or '').strip()
+                if last_holder:
+                    description = f'Placa: {plate} | Último: {last_holder}' if plate else f'Último responsável: {last_holder}'
+            elif mode == 'reactivate':
+                description = f'Placa: {plate}' if plate else 'Veículo removido do cadastro'
+
+            options.append(discord.SelectOption(label=name[:100], value=str(vehicle_id), description=description[:100]))
+
+        placeholder_map = {
+            'checkout': 'Selecione o veículo para retirar',
+            'return': 'Selecione o veículo para devolver',
+            'release': 'Selecione o veículo detido para liberar',
+            'deactivate': 'Selecione o veículo para remover do cadastro',
+            'reactivate': 'Selecione o veículo para reativar no cadastro',
+        }
+        super().__init__(placeholder=placeholder_map.get(mode, 'Selecione um veículo'), min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        vehicle_id = int(self.values[0])
+        selected = next((row for row in self.rows if int(row.get('id', 0) or 0) == vehicle_id), None)
+        if not selected:
+            await self.cog.send_ephemeral_message(interaction, content='Veículo não encontrado na lista atual.')
+            return
+
+        try:
+            if self.mode == 'checkout':
+                await interaction.response.defer(ephemeral=True)
+                await self.cog.checkout_vehicle(interaction, selected)
+                return
+
+            if self.mode == 'return':
+                await interaction.response.defer(ephemeral=True)
+                await self.cog.send_ephemeral_message(
+                    interaction,
+                    content='Selecione se o veículo foi detido e depois continue para informar uma observação, se quiser.',
+                    view=VehicleReturnDecisionView(self.cog, selected),
+                )
+                return
+
+            if self.mode == 'release':
+                await interaction.response.defer(ephemeral=True)
+                await self.cog.release_vehicle(interaction, selected)
+                return
+
+            if self.mode == 'deactivate':
+                await interaction.response.defer(ephemeral=True)
+                await self.cog.send_ephemeral_message(
+                    interaction,
+                    content='Confirme que deseja remover esse veículo do cadastro. Essa ação mantém o histórico, mas oculta o veículo dos fluxos normais.',
+                    view=VehicleDeactivateConfirmView(self.cog, selected),
+                )
+                return
+
+            if self.mode == 'reactivate':
+                await interaction.response.defer(ephemeral=True)
+                await self.cog.reactivate_vehicle(interaction, selected)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha no fluxo do veículo: {exc}')
+
+
+class VehicleSelectView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog', rows: list[dict[str, Any]], mode: str) -> None:
+        super().__init__(timeout=120)
+        self.add_item(VehicleSelect(cog, rows, mode))
+
+
+class VehiclePublicPanelView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog') -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label='Retirar Veículo', style=discord.ButtonStyle.success, emoji='🚗', custom_id='vehicles:checkout')
+    async def checkout_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.start_checkout_flow(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar veículos disponíveis: {exc}')
+
+    @discord.ui.button(label='Devolver Veículo', style=discord.ButtonStyle.secondary, emoji='↩️', custom_id='vehicles:return')
+    async def return_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.start_return_flow(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar seus veículos retirados: {exc}')
+
+    @discord.ui.button(label='Status Garagem', style=discord.ButtonStyle.secondary, emoji='📋', custom_id='vehicles:status')
+    async def status_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.show_status(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar status da garagem: {exc}')
+
+
+class VehicleAdminPanelView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog') -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label='Cadastrar Veículo', style=discord.ButtonStyle.primary, emoji='🧾', custom_id='vehicles:register')
+    async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode cadastrar veículos.')
+            return
+        await interaction.response.send_modal(VehicleRegisterModal(self.cog))
+
+    @discord.ui.button(label='Liberar Detido', style=discord.ButtonStyle.danger, emoji='🚨', custom_id='vehicles:release')
+    async def release_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode liberar veículo detido.')
+            return
+        try:
+            await self.cog.start_release_flow(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar veículos detidos: {exc}')
+
+    @discord.ui.button(label='Remover Veículo', style=discord.ButtonStyle.danger, emoji='🗑️', custom_id='vehicles:deactivate')
+    async def deactivate_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode remover veículo do cadastro.')
+            return
+        try:
+            await self.cog.start_deactivate_flow(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar veículos para remoção: {exc}')
+
+    @discord.ui.button(label='Reativar Veículo', style=discord.ButtonStyle.success, emoji='♻️', custom_id='vehicles:reactivate')
+    async def reactivate_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode reativar veículo removido.')
+            return
+        try:
+            await self.cog.start_reactivate_flow(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar veículos removidos: {exc}')
+
+    @discord.ui.button(label='Status Garagem', style=discord.ButtonStyle.secondary, emoji='📋', custom_id='vehicles:status')
+    async def status_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.show_status(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar status da garagem: {exc}')
+
+
+class VehicleExpirationRegisterModal(discord.ui.Modal):
+    def __init__(self, cog: 'VehicleCog') -> None:
+        super().__init__(title='Cadastrar Vencimento de Veículo')
+        self.cog = cog
+        self.vehicle_name = discord.ui.TextInput(
+            label='Nome/modelo do veículo',
+            placeholder='Ex: Sultan RS, Banshee, Sprinter',
+            required=True,
+            max_length=191,
+        )
+        self.purchased_at = discord.ui.TextInput(
+            label='Data da compra',
+            placeholder='Ex: 07/04/2026',
+            required=True,
+            max_length=10,
+        )
+        self.duration_days = discord.ui.TextInput(
+            label='Dias do contrato',
+            placeholder='Ex: 7, 15, 30 ou outro valor',
+            required=True,
+            max_length=4,
+        )
+        self.add_item(self.vehicle_name)
+        self.add_item(self.purchased_at)
+        self.add_item(self.duration_days)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            duration_days = int(str(self.duration_days).strip())
+        except ValueError:
+            await self.cog.send_ephemeral_message(interaction, content='Informe um número válido de dias para o contrato.')
+            return
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+            await self.cog.register_vexp(
+                interaction,
+                str(self.vehicle_name).strip(),
+                str(self.purchased_at).strip(),
+                duration_days,
+            )
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao cadastrar vencimento: {exc}')
+
+
+class VehicleExpirationRecipientSelect(discord.ui.UserSelect):
+    def __init__(self, parent_view: 'VehicleExpirationRecipientView') -> None:
+        self.parent_view = parent_view
+        super().__init__(placeholder='Selecione quem vai receber os avisos', min_values=1, max_values=10)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent_view.selected_user_ids = [str(user.id) for user in self.values]
+        self.parent_view.selected_labels = [user.display_name for user in self.values]
+        await interaction.response.edit_message(embed=self.parent_view.current_embed(), view=self.parent_view)
+
+
+class VehicleExpirationRecipientView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog', selected_user_ids: list[str]) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.selected_user_ids = selected_user_ids[:]
+        self.selected_labels: list[str] = []
+        self.add_item(VehicleExpirationRecipientSelect(self))
+
+    def current_embed(self) -> discord.Embed:
+        description = 'Selecione os usuários do Discord que receberão DM automática quando um vencimento de veículo estiver perto de expirar.'
+        selected_text = '\n'.join(f'- <@{uid}>' for uid in self.selected_user_ids) if self.selected_user_ids else 'Nenhum usuário selecionado.'
+        embed = discord.Embed(title='Destinatários dos Avisos de Vencimento de Veículo', description=description, color=0x6EA8FE)
+        embed.add_field(name='Selecionados', value=selected_text, inline=False)
+        return embed
+
+    @discord.ui.button(label='Salvar Destinatários', style=discord.ButtonStyle.success, emoji='💾')
+    async def save_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self.cog.save_vexp_recipients(interaction, self.selected_user_ids)
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content='Seleção de destinatários cancelada.', embed=None, view=None)
+
+
+class VehicleExpirationSimulationSelect(discord.ui.Select):
+    def __init__(self, cog: 'VehicleCog', rows: list[dict[str, Any]]) -> None:
+        self.cog = cog
+        self.rows = rows
+        options: list[discord.SelectOption] = []
+
+        for row in rows[:25]:
+            contract_id = int(row.get('id', 0) or 0)
+            if contract_id <= 0:
+                continue
+            vehicle_name = str(row.get('vehicle_name', 'Veículo')).strip() or 'Veículo'
+            expires_at = format_vexp_date(row.get('expires_at'))
+            days_remaining = int(row.get('days_remaining', 0) or 0)
+            if days_remaining < 0:
+                description = f'Venceu em {expires_at}'
+            elif days_remaining == 0:
+                description = f'Vence hoje | {expires_at}'
+            elif days_remaining == 1:
+                description = f'Vence amanhã | {expires_at}'
+            else:
+                description = f'Vence em {days_remaining} dias | {expires_at}'
+            options.append(discord.SelectOption(label=vehicle_name[:100], value=str(contract_id), description=description[:100]))
+
+        super().__init__(placeholder='Selecione o veículo para simular o aviso', min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        contract_id = int(self.values[0])
+        selected = next((r for r in self.rows if int(r.get('id', 0) or 0) == contract_id), None)
+        if not selected:
+            await self.cog.send_ephemeral_message(interaction, content='Veículo não encontrado na lista atual.')
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+            await self.cog.simulate_vexp_notification(interaction, selected)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao simular aviso: {exc}')
+
+
+class VehicleExpirationSimulationView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog', rows: list[dict[str, Any]]) -> None:
+        super().__init__(timeout=120)
+        self.add_item(VehicleExpirationSimulationSelect(cog, rows))
+
+
+class VehicleExpirationDeleteSelect(discord.ui.Select):
+    def __init__(self, cog: 'VehicleCog', rows: list[dict[str, Any]]) -> None:
+        self.cog = cog
+        self.rows = rows
+        options: list[discord.SelectOption] = []
+
+        for row in rows[:25]:
+            contract_id = int(row.get('id', 0) or 0)
+            if contract_id <= 0:
+                continue
+            vehicle_name = str(row.get('vehicle_name', 'Veículo')).strip() or 'Veículo'
+            expires_at = format_vexp_date(row.get('expires_at')) or 'Sem vencimento'
+            options.append(discord.SelectOption(label=vehicle_name[:100], value=str(contract_id), description=f'Vence em: {expires_at}'[:100]))
+
+        super().__init__(placeholder='Selecione o veículo para remover', min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        contract_id = int(self.values[0])
+        selected = next((r for r in self.rows if int(r.get('id', 0) or 0) == contract_id), None)
+        if not selected:
+            await self.cog.send_ephemeral_message(interaction, content='Veículo não encontrado na lista atual.')
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+            await self.cog.delete_vexp(interaction, selected)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao remover vencimento: {exc}')
+
+
+class VehicleExpirationDeleteView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog', rows: list[dict[str, Any]]) -> None:
+        super().__init__(timeout=120)
+        self.add_item(VehicleExpirationDeleteSelect(cog, rows))
+
+
+class VehicleExpirationPanelView(discord.ui.View):
+    def __init__(self, cog: 'VehicleCog') -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label='Cadastrar Veículo', style=discord.ButtonStyle.primary, emoji='🚗', custom_id='vexp:register')
+    async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage_vexp(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode cadastrar vencimentos de veículos.')
+            return
+        await interaction.response.send_modal(VehicleExpirationRegisterModal(self.cog))
+
+    @discord.ui.button(label='Definir Destinatários', style=discord.ButtonStyle.secondary, emoji='👥', custom_id='vexp:recipients')
+    async def recipients_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage_vexp(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode definir os destinatários.')
+            return
+        try:
+            await self.cog.start_vexp_recipient_flow(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao abrir destinatários: {exc}')
+
+    @discord.ui.button(label='Status dos Vencimentos', style=discord.ButtonStyle.success, emoji='⏰', custom_id='vexp:status')
+    async def status_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.show_vexp_status(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar status dos vencimentos: {exc}')
+
+    @discord.ui.button(label='Simular Aviso', style=discord.ButtonStyle.secondary, emoji='🔔', custom_id='vexp:simulate')
+    async def simulate_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage_vexp(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode simular avisos.')
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+            payload = await self.cog.fetch_vexp_payload(include_expired=True)
+            rows = payload.get('rows', []) if isinstance(payload.get('rows'), list) else []
+            if not rows:
+                await self.cog.send_ephemeral_message(interaction, content='Nenhum vencimento cadastrado para simular.')
+                return
+            await self.cog.send_ephemeral_message(interaction, content='Selecione o veículo para simular o aviso.', view=VehicleExpirationSimulationView(self.cog, rows))
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar vencimentos: {exc}')
+
+    @discord.ui.button(label='Remover Veículo', style=discord.ButtonStyle.danger, emoji='🗑️', custom_id='vexp:delete')
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.user_can_manage_vexp(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode remover vencimentos.')
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+            payload = await self.cog.fetch_vexp_payload(include_expired=True)
+            rows = payload.get('rows', []) if isinstance(payload.get('rows'), list) else []
+            if not rows:
+                await self.cog.send_ephemeral_message(interaction, content='Nenhum vencimento cadastrado para remover.')
+                return
+            await self.cog.send_ephemeral_message(interaction, content='Selecione o veículo para remover o vencimento.', view=VehicleExpirationDeleteView(self.cog, rows))
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao carregar vencimentos: {exc}')
+
+
+class VehicleCog(commands.Cog):
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self.api = FinanceApiClient()
+        self.manager_role_ids = role_ids_from_config('VEHICLE_MANAGER_ROLE_IDS')
+        self.vexp_manager_role_ids = role_ids_from_config('VEHICLE_EXPIRATION_MANAGER_ROLE_IDS')
+
+    async def cog_load(self) -> None:
+        self.bot.add_view(VehiclePublicPanelView(self))
+        self.bot.add_view(VehicleAdminPanelView(self))
+        self.bot.add_view(VehicleExpirationPanelView(self))
+        if not self.auto_return_loop.is_running():
+            self.auto_return_loop.start()
+        if not self.vexp_notification_loop.is_running():
+            self.vexp_notification_loop.start()
+
+    async def cog_unload(self) -> None:
+        if self.auto_return_loop.is_running():
+            self.auto_return_loop.cancel()
+        if self.vexp_notification_loop.is_running():
+            self.vexp_notification_loop.cancel()
+        await self.api.close()
+
+    def ephemeral_delete_after(self) -> float | None:
+        value = float(getattr(config, 'VEHICLE_EPHEMERAL_DELETE_AFTER_SECONDS', 120) or 0)
+        return value if value > 0 else None
+
+    def log_delete_after(self) -> float | None:
+        value = float(getattr(config, 'VEHICLE_LOG_DELETE_AFTER_SECONDS', 0) or 0)
+        return value if value > 0 else None
+
+    async def delete_message_later(self, message: discord.Message | discord.InteractionMessage | discord.WebhookMessage | None, delay: float | None) -> None:
+        if message is None or delay is None:
+            return
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    async def send_ephemeral_message(self, interaction: discord.Interaction, *, content: str | None = None, embed: discord.Embed | None = None, view: discord.ui.View | None = None) -> None:
+        delete_after = self.ephemeral_delete_after()
+        kwargs: dict[str, Any] = {'ephemeral': True}
+        if content is not None:
+            kwargs['content'] = content
+        if embed is not None:
+            kwargs['embed'] = embed
+        if view is not None:
+            kwargs['view'] = view
+
+        if interaction.response.is_done():
+            message = await interaction.followup.send(wait=True, **kwargs)
+            if delete_after is not None:
+                asyncio.create_task(self.delete_message_later(message, delete_after))
+            return
+
+        await interaction.response.send_message(**kwargs)
+        if delete_after is not None:
+            try:
+                message = await interaction.original_response()
+            except (discord.NotFound, discord.HTTPException):
+                return
+            asyncio.create_task(self.delete_message_later(message, delete_after))
+
+    def user_can_manage(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None:
+            return False
+        if member.guild_permissions.administrator:
+            return True
+        return has_any_role(member, self.manager_role_ids)
+
+    async def vehicle_log_channel(self, interaction: discord.Interaction) -> discord.abc.Messageable | None:
+        channel_id = int(getattr(config, 'VEHICLE_LOG_CHANNEL_ID', 0) or 0)
+        if channel_id > 0:
+            try:
+                return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                LOGGER.warning('Nao foi possivel acessar VEHICLE_LOG_CHANNEL_ID=%s', channel_id)
+                return interaction.channel
+        return interaction.channel
+
+    async def send_vehicle_log(self, interaction: discord.Interaction, title: str, color: int, fields: list[tuple[str, str, bool]]) -> None:
+        destination = await self.vehicle_log_channel(interaction)
+        if destination is None:
+            return
+        embed = discord.Embed(title=title, color=color)
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        for name, value, inline in fields:
+            embed.add_field(name=name, value=value, inline=inline)
+        try:
+            message = await destination.send(embed=embed)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            LOGGER.warning('Falha ao enviar log de veiculo para o Discord.')
+            return
+        delete_after = self.log_delete_after()
+        if delete_after is not None:
+            asyncio.create_task(self.delete_message_later(message, delete_after))
+
+    async def fetch_vehicle_rows(self, *, status: str = '', holder_discord_id: str = '') -> list[dict[str, Any]]:
+        params: dict[str, str] = {}
+        if status:
+            params['status'] = status
+        if holder_discord_id:
+            params['holder_discord_id'] = holder_discord_id
+        endpoint = 'vehicles_list.php'
+        if params:
+            endpoint += '?' + urlencode(params)
+        data = await self.api.get(endpoint)
+        rows = data.get('rows', [])
+        if not isinstance(rows, list):
+            raise FinanceApiError('Lista de veículos inválida retornada pela API.')
+        return [row for row in rows if isinstance(row, dict)]
+
+    async def fetch_vehicle_summary(self) -> dict[str, Any]:
+        data = await self.api.get('vehicles_list.php')
+        summary = data.get('summary', {})
+        return summary if isinstance(summary, dict) else {}
+
+    async def register_vehicle(self, interaction: discord.Interaction, vehicle_name: str, vehicle_plate: str) -> None:
+        await self.api.post('vehicle_register.php', {
+            'name': vehicle_name,
+            'plate': vehicle_plate,
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+        })
+        await self.send_ephemeral_message(interaction, content=f'Veículo cadastrado: {vehicle_name} | Placa: {vehicle_plate}')
+        await self.send_vehicle_log(interaction, 'Veículo cadastrado', 0x0D6EFD, [('Veículo', vehicle_name, True), ('Placa', vehicle_plate, True)])
+
+    async def checkout_vehicle(self, interaction: discord.Interaction, vehicle_row: dict[str, Any]) -> None:
+        response = await self.api.post('vehicle_checkout.php', {
+            'vehicle_id': int(vehicle_row.get('id', 0) or 0),
+            'holder_name': interaction.user.display_name,
+            'holder_discord_id': str(interaction.user.id),
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+        })
+        updated_row = response.get('vehicle', vehicle_row)
+        if not isinstance(updated_row, dict):
+            updated_row = vehicle_row
+        vehicle_name = str(updated_row.get('name', vehicle_row.get('name', 'Veículo'))).strip() or 'Veículo'
+        vehicle_plate = str(updated_row.get('plate', vehicle_row.get('plate', '')) or '').strip()
+        checked_out_at = format_vehicle_timestamp(updated_row.get('checked_out_at') or updated_row.get('last_checkout_at'))
+        log_fields = [('Veículo', vehicle_name, True), ('Responsável', interaction.user.display_name, True)]
+        if vehicle_plate:
+            log_fields.append(('Placa', vehicle_plate, True))
+        if checked_out_at:
+            log_fields.append(('Retirado em', checked_out_at, True))
+        await self.send_ephemeral_message(interaction, content=f'Veículo retirado: {vehicle_name}' + (f' | Placa: {vehicle_plate}' if vehicle_plate else ''))
+        await self.send_vehicle_log(interaction, 'Veículo retirado', 0x198754, log_fields)
+
+    async def return_vehicle(self, interaction: discord.Interaction, vehicle_row: dict[str, Any], detained: bool, note: str) -> None:
+        response = await self.api.post('vehicle_return.php', {
+            'vehicle_id': int(vehicle_row.get('id', 0) or 0),
+            'holder_name': interaction.user.display_name,
+            'holder_discord_id': str(interaction.user.id),
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+            'detained': detained,
+            'note': note,
+        })
+        updated_row = response.get('vehicle', vehicle_row)
+        if not isinstance(updated_row, dict):
+            updated_row = vehicle_row
+        vehicle_name = str(updated_row.get('name', vehicle_row.get('name', 'Veículo'))).strip() or 'Veículo'
+        vehicle_plate = str(updated_row.get('plate', vehicle_row.get('plate', '')) or '').strip()
+        checked_out_at = format_vehicle_timestamp(updated_row.get('last_checkout_at') or vehicle_row.get('checked_out_at'))
+        returned_at = format_vehicle_timestamp(updated_row.get('last_returned_at'))
+        status_label = 'DETIDO' if detained else 'Devolvido'
+        log_fields = [
+            ('Veículo', vehicle_name, True),
+            ('Responsável', interaction.user.display_name, True),
+            ('Detido', 'Sim' if detained else 'Não', True),
+        ]
+        if vehicle_plate:
+            log_fields.append(('Placa', vehicle_plate, True))
+        if checked_out_at:
+            log_fields.append(('Retirado em', checked_out_at, True))
+        if returned_at:
+            log_fields.append(('Devolvido em', returned_at, True))
+        log_fields.append(('Obs.', note or 'Sem observação', False))
+        await self.send_ephemeral_message(interaction, content=f'{status_label}: {vehicle_name}' + (f' | Placa: {vehicle_plate}' if vehicle_plate else ''))
+        await self.send_vehicle_log(interaction, 'Veículo devolvido', 0xFFC107 if detained else 0x0DCAF0, log_fields)
+
+    async def release_vehicle(self, interaction: discord.Interaction, vehicle_row: dict[str, Any]) -> None:
+        await self.api.post('vehicle_release.php', {
+            'vehicle_id': int(vehicle_row.get('id', 0) or 0),
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+            'note': 'Liberado pela gerência via Discord.',
+        })
+        vehicle_name = str(vehicle_row.get('name', 'Veículo')).strip() or 'Veículo'
+        vehicle_plate = str(vehicle_row.get('plate', '') or '').strip()
+        await self.send_ephemeral_message(interaction, content=f'Veículo liberado: {vehicle_name}' + (f' | Placa: {vehicle_plate}' if vehicle_plate else ''))
+        log_fields = [('Veículo', vehicle_name, True)]
+        if vehicle_plate:
+            log_fields.append(('Placa', vehicle_plate, True))
+        await self.send_vehicle_log(interaction, 'Veículo liberado', 0x6F42C1, log_fields)
+
+    async def deactivate_vehicle(self, interaction: discord.Interaction, vehicle_row: dict[str, Any]) -> None:
+        response = await self.api.post('vehicle_deactivate.php', {
+            'vehicle_id': int(vehicle_row.get('id', 0) or 0),
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+            'note': 'Veículo removido do cadastro via Discord.',
+        })
+        updated_row = response.get('vehicle', vehicle_row)
+        if not isinstance(updated_row, dict):
+            updated_row = vehicle_row
+        vehicle_name = str(updated_row.get('name', vehicle_row.get('name', 'Veículo'))).strip() or 'Veículo'
+        vehicle_plate = str(updated_row.get('plate', vehicle_row.get('plate', '')) or '').strip()
+        await self.send_ephemeral_message(interaction, content=f'Veículo removido do cadastro: {vehicle_name}' + (f' | Placa: {vehicle_plate}' if vehicle_plate else ''))
+        log_fields = [('Veículo', vehicle_name, True)]
+        if vehicle_plate:
+            log_fields.append(('Placa', vehicle_plate, True))
+        await self.send_vehicle_log(interaction, 'Veículo removido do cadastro', 0xDC3545, log_fields)
+
+    async def reactivate_vehicle(self, interaction: discord.Interaction, vehicle_row: dict[str, Any]) -> None:
+        response = await self.api.post('vehicle_reactivate.php', {
+            'vehicle_id': int(vehicle_row.get('id', 0) or 0),
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+            'note': 'Veículo reativado via Discord.',
+        })
+        updated_row = response.get('vehicle', vehicle_row)
+        if not isinstance(updated_row, dict):
+            updated_row = vehicle_row
+        vehicle_name = str(updated_row.get('name', vehicle_row.get('name', 'Veículo'))).strip() or 'Veículo'
+        vehicle_plate = str(updated_row.get('plate', vehicle_row.get('plate', '')) or '').strip()
+        await self.send_ephemeral_message(interaction, content=f'Veículo reativado no cadastro: {vehicle_name}' + (f' | Placa: {vehicle_plate}' if vehicle_plate else ''))
+        log_fields = [('Veículo', vehicle_name, True)]
+        if vehicle_plate:
+            log_fields.append(('Placa', vehicle_plate, True))
+        await self.send_vehicle_log(interaction, 'Veículo reativado', 0x198754, log_fields)
+
+    async def start_checkout_flow(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        rows = await self.fetch_vehicle_rows(status='available')
+        if not rows:
+            await self.send_ephemeral_message(interaction, content='Nenhum veículo disponível na garagem.')
+            return
+        await self.send_ephemeral_message(interaction, content='Selecione o veículo que você vai retirar.', view=VehicleSelectView(self, rows, 'checkout'))
+
+    async def start_return_flow(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        rows = await self.fetch_vehicle_rows(status='checked_out', holder_discord_id=str(interaction.user.id))
+        if not rows:
+            await self.send_ephemeral_message(interaction, content='Você não está com nenhum veículo retirado no momento.')
+            return
+        await self.send_ephemeral_message(interaction, content='Selecione o veículo que você vai devolver.', view=VehicleSelectView(self, rows, 'return'))
+
+    async def start_release_flow(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        rows = await self.fetch_vehicle_rows(status='detained')
+        if not rows:
+            await self.send_ephemeral_message(interaction, content='Nenhum veículo está marcado como detido.')
+            return
+        await self.send_ephemeral_message(interaction, content='Selecione o veículo detido para liberar.', view=VehicleSelectView(self, rows, 'release'))
+
+    async def start_deactivate_flow(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        rows = await self.fetch_vehicle_rows(status='available')
+        if not rows:
+            await self.send_ephemeral_message(interaction, content='Nenhum veículo disponível pode ser removido do cadastro agora.')
+            return
+        await self.send_ephemeral_message(interaction, content='Selecione o veículo disponível que será removido do cadastro.', view=VehicleSelectView(self, rows, 'deactivate'))
+
+    async def start_reactivate_flow(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        rows = await self.fetch_vehicle_rows(status='inactive')
+        if not rows:
+            await self.send_ephemeral_message(interaction, content='Nenhum veículo removido do cadastro está disponível para reativação.')
+            return
+        await self.send_ephemeral_message(interaction, content='Selecione o veículo removido que será reativado no cadastro.', view=VehicleSelectView(self, rows, 'reactivate'))
+
+    async def show_status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        summary = await self.fetch_vehicle_summary()
+        available_rows = await self.fetch_vehicle_rows(status='available')
+        checked_out_rows = await self.fetch_vehicle_rows(status='checked_out')
+        detained_rows = await self.fetch_vehicle_rows(status='detained')
+
+        lines = [
+            f"✅ Disponíveis: {int(summary.get('available_count', 0) or 0)}",
+            f"🚗 Retirados: {int(summary.get('checked_out_count', 0) or 0)}",
+            f"🚨 Detidos: {int(summary.get('detained_count', 0) or 0)}",
+            f"⛔ Removidos: {int(summary.get('inactive_count', 0) or 0)}",
+            '',
+        ]
+        if checked_out_rows:
+            lines.append('Retirados agora:')
+            for row in checked_out_rows[:8]:
+                checked_out_at = format_vehicle_timestamp(row.get('checked_out_at'))
+                time_suffix = f' | Retirado em: {checked_out_at}' if checked_out_at else ''
+                plate_suffix = f" | Placa: {row.get('plate', '')}" if str(row.get('plate', '') or '').strip() else ''
+                lines.append(f"- {vehicle_status_emoji(str(row.get('status', '')))} {row.get('name', 'Veículo')}{plate_suffix} | {row.get('current_holder_name', 'Sem responsável')}{time_suffix}")
+            lines.append('')
+        if detained_rows:
+            lines.append('Detidos:')
+            for row in detained_rows[:8]:
+                returned_at = format_vehicle_timestamp(row.get('last_returned_at'))
+                time_suffix = f' | Devolvido em: {returned_at}' if returned_at else ''
+                plate_suffix = f" | Placa: {row.get('plate', '')}" if str(row.get('plate', '') or '').strip() else ''
+                lines.append(f"- {vehicle_status_emoji(str(row.get('status', '')))} {row.get('name', 'Veículo')}{plate_suffix} | Último: {row.get('last_holder_name', 'Sem histórico')}{time_suffix}")
+            lines.append('')
+        if available_rows:
+            lines.append('Disponíveis:')
+            for row in available_rows[:8]:
+                last_holder = str(row.get('last_holder_name', '') or '').strip()
+                returned_at = format_vehicle_timestamp(row.get('last_returned_at'))
+                suffix = f' | Último: {last_holder}' if last_holder else ''
+                if returned_at:
+                    suffix += f' | Devolvido em: {returned_at}'
+                plate_suffix = f" | Placa: {row.get('plate', '')}" if str(row.get('plate', '') or '').strip() else ''
+                lines.append(f"- {vehicle_status_emoji(str(row.get('status', '')))} {row.get('name', 'Veículo')}{plate_suffix}{suffix}")
+
+        embed = discord.Embed(title='Garagem Favela', description='\n'.join(lines).strip(), color=0x6EA8FE)
+        await self.send_ephemeral_message(interaction, embed=embed)
+
+    def public_panel_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title='🚗 GARAGEM - VEÍCULOS FAVELA',
+            description='Painel operacional da garagem. Use para retirar, devolver e consultar o status dos veículos.',
+            color=0x6EA8FE,
+        )
+        embed.set_footer(text='Veículos LA FIRMA')
+        return embed
+
+    def admin_panel_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title='🧾 GARAGEM - PAINEL ADMIN',
+            description='Painel restrito da garagem. Use para cadastrar, liberar detidos, remover do cadastro e reativar veículos removidos.',
+            color=0xDC3545,
+        )
+        embed.set_footer(text='Veículos LA FIRMA | ADM/GERÊNCIA')
+        return embed
+
+    def public_panel_view(self) -> discord.ui.View:
+        return VehiclePublicPanelView(self)
+
+    def admin_panel_view(self) -> discord.ui.View:
+        return VehicleAdminPanelView(self)
+
+    async def send_public_panel(self, destination: discord.abc.Messageable) -> None:
+        await destination.send(embed=self.public_panel_embed(), view=self.public_panel_view())
+
+    async def send_admin_panel(self, destination: discord.abc.Messageable) -> None:
+        await destination.send(embed=self.admin_panel_embed(), view=self.admin_panel_view())
+
+    async def publish_panel(self, interaction: discord.Interaction, configured_channel_id: int, panel_kind: str) -> str:
+        fallback_channel = interaction.channel
+        send_panel = self.send_admin_panel if panel_kind == 'admin' else self.send_public_panel
+        if configured_channel_id <= 0:
+            if fallback_channel is None:
+                raise FinanceApiError('Canal atual indisponível para enviar o painel de veículos.')
+            await send_panel(fallback_channel)
+            return 'current'
+
+        try:
+            channel = self.bot.get_channel(configured_channel_id) or await self.bot.fetch_channel(configured_channel_id)
+            await send_panel(channel)
+            return 'configured'
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            if fallback_channel is None:
+                raise FinanceApiError('O bot não conseguiu acessar o canal configurado do painel de veículos.')
+            await send_panel(fallback_channel)
+            return 'fallback'
+
+    @app_commands.command(name='painelveiculos', description='Envia o painel público da garagem de veículos.')
+    async def painel_veiculos(self, interaction: discord.Interaction) -> None:
+        if not self.user_can_manage(interaction):
+            await self.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode publicar o painel de veículos.')
+            return
+        await interaction.response.defer(ephemeral=True)
+        channel_id = int(getattr(config, 'VEHICLE_PANEL_CHANNEL_ID', 0) or 0)
+        try:
+            destination = await self.publish_panel(interaction, channel_id, 'public')
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao publicar painel de veículos: {exc}')
+            return
+        if destination == 'configured':
+            await self.send_ephemeral_message(interaction, content='Painel de veículos enviado no canal configurado.')
+            return
+        if destination == 'fallback' and channel_id > 0:
+            await self.send_ephemeral_message(interaction, content='O canal configurado não pôde ser acessado. Enviei o painel de veículos neste canal.')
+            return
+        await self.send_ephemeral_message(interaction, content='Painel de veículos enviado neste canal.')
+
+    @app_commands.command(name='painelveiculosadm', description='Envia o painel administrativo da garagem de veículos.')
+    async def painel_veiculos_adm(self, interaction: discord.Interaction) -> None:
+        if not self.user_can_manage(interaction):
+            await self.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode publicar o painel administrativo de veículos.')
+            return
+        await interaction.response.defer(ephemeral=True)
+        channel_id = int(getattr(config, 'VEHICLE_ADMIN_PANEL_CHANNEL_ID', 0) or 0)
+        try:
+            destination = await self.publish_panel(interaction, channel_id, 'admin')
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao publicar painel administrativo de veículos: {exc}')
+            return
+        if destination == 'configured':
+            await self.send_ephemeral_message(interaction, content='Painel administrativo de veículos enviado no canal configurado.')
+            return
+        if destination == 'fallback' and channel_id > 0:
+            await self.send_ephemeral_message(interaction, content='O canal administrativo configurado não pôde ser acessado. Enviei o painel administrativo neste canal.')
+            return
+        await self.send_ephemeral_message(interaction, content='Painel administrativo de veículos enviado neste canal.')
+
+
+    # ------------------------------------------------------------------
+    # Vehicle expiration tracking
+    # ------------------------------------------------------------------
+
+    def user_can_manage_vexp(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None:
+            return False
+        if member.guild_permissions.administrator:
+            return True
+        return has_any_role(member, self.vexp_manager_role_ids)
+
+    def vexp_ephemeral_delete_after(self) -> float | None:
+        value = float(getattr(config, 'VEHICLE_EXPIRATION_EPHEMERAL_DELETE_AFTER_SECONDS', 120) or 0)
+        return value if value > 0 else None
+
+    def vexp_log_delete_after(self) -> float | None:
+        value = float(getattr(config, 'VEHICLE_EXPIRATION_LOG_DELETE_AFTER_SECONDS', 0) or 0)
+        return value if value > 0 else None
+
+    def vexp_reminder_days(self) -> list[int]:
+        value = getattr(config, 'VEHICLE_EXPIRATION_REMINDER_DAYS', [3, 1, 0])
+        if not isinstance(value, list):
+            return [3, 1, 0]
+        return [int(d) for d in value if isinstance(d, (int, float)) and int(d) >= 0]
+
+    async def vexp_log_channel(self, interaction: discord.Interaction | None) -> discord.abc.Messageable | None:
+        channel_id = int(getattr(config, 'VEHICLE_EXPIRATION_LOG_CHANNEL_ID', 0) or 0)
+        if channel_id > 0:
+            try:
+                return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                LOGGER.warning('Nao foi possivel acessar VEHICLE_EXPIRATION_LOG_CHANNEL_ID=%s', channel_id)
+                return interaction.channel if interaction else None
+        return interaction.channel if interaction else None
+
+    async def send_vexp_log(self, interaction: discord.Interaction | None, title: str, color: int, fields: list[tuple[str, str, bool]]) -> None:
+        destination = await self.vexp_log_channel(interaction)
+        if destination is None:
+            return
+        embed = discord.Embed(title=title, color=color)
+        if interaction is not None:
+            embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        for name, value, inline in fields:
+            embed.add_field(name=name, value=value, inline=inline)
+        try:
+            message = await destination.send(embed=embed)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            LOGGER.warning('Falha ao enviar log de vencimento de veículo para o Discord.')
+            return
+        delete_after = self.vexp_log_delete_after()
+        if delete_after is not None:
+            asyncio.create_task(self.delete_message_later(message, delete_after))
+
+    async def fetch_vexp_payload(self, include_expired: bool = True) -> dict[str, Any]:
+        param = '1' if include_expired else '0'
+        data = await self.api.get(f'vehicle_expirations_list.php?include_expired={param}')
+        if not isinstance(data, dict):
+            raise FinanceApiError('Resposta inválida da API de vencimentos de veículos.')
+        return data
+
+    async def fetch_vexp_settings(self) -> dict[str, Any]:
+        payload = await self.fetch_vexp_payload()
+        settings = payload.get('settings', {})
+        return settings if isinstance(settings, dict) else {}
+
+    async def register_vexp(self, interaction: discord.Interaction, vehicle_name: str, purchased_at: str, duration_days: int) -> None:
+        await self.api.post('vehicle_expiration_register.php', {
+            'vehicle_name': vehicle_name,
+            'purchased_at': purchased_at,
+            'duration_days': duration_days,
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+        })
+        await self.send_ephemeral_message(interaction, content=f'Vencimento cadastrado: {vehicle_name}')
+        await self.send_vexp_log(interaction, 'Vencimento de veículo cadastrado', 0x0D6EFD, [
+            ('Veículo', vehicle_name, True),
+            ('Comprado em', purchased_at, True),
+            ('Duração', f'{duration_days} dias', True),
+        ])
+
+    async def delete_vexp(self, interaction: discord.Interaction, row: dict[str, Any]) -> None:
+        contract_id = int(row.get('id', 0) or 0)
+        vehicle_name = str(row.get('vehicle_name', 'Veículo')).strip() or 'Veículo'
+        await self.api.post('vehicle_expiration_delete.php', {'contract_id': contract_id})
+        await self.send_ephemeral_message(interaction, content=f'Vencimento removido: {vehicle_name}')
+        await self.send_vexp_log(interaction, 'Vencimento de veículo removido', 0xDC3545, [('Veículo', vehicle_name, True)])
+
+    async def save_vexp_recipients(self, interaction: discord.Interaction, recipient_ids: list[str]) -> None:
+        await self.api.post('vehicle_expiration_notification_settings_save.php', {
+            'recipient_discord_ids': recipient_ids,
+            'actor_name': interaction.user.display_name,
+            'actor_discord_id': str(interaction.user.id),
+        })
+        count = len(recipient_ids)
+        await self.send_ephemeral_message(interaction, content=f'Destinatários salvos: {count} usuário(s).')
+
+    async def start_vexp_recipient_flow(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        settings = await self.fetch_vexp_settings()
+        selected_ids = settings.get('recipient_discord_ids', [])
+        if not isinstance(selected_ids, list):
+            selected_ids = []
+        view = VehicleExpirationRecipientView(self, [str(v) for v in selected_ids])
+        await self.send_ephemeral_message(interaction, embed=view.current_embed(), view=view)
+
+    async def simulate_vexp_notification(self, interaction: discord.Interaction, row: dict[str, Any]) -> None:
+        contract_id = int(row.get('id', 0) or 0)
+        settings = await self.fetch_vexp_settings()
+        recipient_ids = settings.get('recipient_discord_ids', []) if isinstance(settings, dict) else []
+        if not isinstance(recipient_ids, list) or not recipient_ids:
+            raise FinanceApiError('Nenhum destinatário configurado para receber a simulação.')
+
+        vehicle_name = str(row.get('vehicle_name', 'Veículo')).strip() or 'Veículo'
+        days_remaining = int(row.get('days_remaining', 0) or 0)
+        reminder_days = days_remaining if days_remaining >= 0 else 0
+        message_text = build_vexp_notification_message(row, reminder_days, simulation=True)
+
+        sent = 0
+        failed = 0
+        failed_ids: list[str] = []
+        for recipient_id in recipient_ids:
+            discord_user_id = str(recipient_id).strip()
+            if discord_user_id == '':
+                continue
+            try:
+                user = self.bot.get_user(int(discord_user_id))
+                if user is None:
+                    user = await self.bot.fetch_user(int(discord_user_id))
+                await user.send(message_text)
+                sent += 1
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+                failed += 1
+                failed_ids.append(discord_user_id)
+
+        result_lines = [f'Simulação enviada para: {vehicle_name}', f'Entregues: {sent}', f'Falhas: {failed}']
+        if failed_ids:
+            result_lines.append('Falharam: ' + ', '.join(f'<@{uid}>' for uid in failed_ids))
+        await self.send_ephemeral_message(interaction, content='\n'.join(result_lines))
+        await self.send_vexp_log(interaction, 'Simulação de aviso de vencimento de veículo', 0xDC3545, [
+            ('Veículo', vehicle_name, True),
+            ('Entregues', str(sent), True),
+            ('Falhas', str(failed), True),
+        ])
+
+    async def show_vexp_status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        payload = await self.fetch_vexp_payload(include_expired=True)
+        rows = payload.get('rows', []) if isinstance(payload.get('rows'), list) else []
+        settings = payload.get('settings', {}) if isinstance(payload.get('settings'), dict) else {}
+
+        active_rows = [r for r in rows if isinstance(r, dict) and int(r.get('days_remaining', 0) or 0) >= 0]
+        expired_rows = [r for r in rows if isinstance(r, dict) and int(r.get('days_remaining', 0) or 0) < 0]
+        recipient_ids = settings.get('recipient_discord_ids', []) if isinstance(settings.get('recipient_discord_ids', []), list) else []
+
+        lines = [
+            f'🚗 Ativos: {len(active_rows)}',
+            f'⚠️ Expirados: {len(expired_rows)}',
+            f'👥 Destinatários: {len(recipient_ids)}',
+            '',
+        ]
+
+        if active_rows:
+            lines.append('Próximos vencimentos:')
+            for r in active_rows[:10]:
+                vehicle_name = str(r.get('vehicle_name', 'Veículo')).strip() or 'Veículo'
+                expires_at = format_vexp_date(r.get('expires_at'))
+                days_remaining = int(r.get('days_remaining', 0) or 0)
+                if days_remaining == 0:
+                    status = 'vence hoje'
+                elif days_remaining == 1:
+                    status = 'vence amanhã'
+                else:
+                    status = f'vence em {days_remaining} dias'
+                lines.append(f'- {vehicle_name} | {expires_at} | {status}')
+            lines.append('')
+
+        if expired_rows:
+            lines.append('Já vencidos:')
+            for r in expired_rows[:5]:
+                vehicle_name = str(r.get('vehicle_name', 'Veículo')).strip() or 'Veículo'
+                expires_at = format_vexp_date(r.get('expires_at'))
+                lines.append(f'- {vehicle_name} | venceu em {expires_at}')
+            lines.append('')
+
+        if recipient_ids:
+            lines.append('Destinatários atuais:')
+            for rid in recipient_ids:
+                lines.append(f'- <@{rid}>')
+
+        embed = discord.Embed(title='Vencimentos de Veículos', description='\n'.join(lines).strip(), color=0x6EA8FE)
+        await self.send_ephemeral_message(interaction, embed=embed)
+
+    async def enqueue_vexp_notifications(self, source: str = 'auto') -> dict[str, Any]:
+        data = await self.api.post('vehicle_expiration_notifications_enqueue.php', {
+            'source': source,
+            'reminder_days': self.vexp_reminder_days(),
+        })
+        result = data.get('result')
+        if not isinstance(result, dict):
+            raise FinanceApiError('Resposta inválida ao enfileirar avisos de vencimento de veículo.')
+        return result
+
+    async def claim_vexp_notification_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        data = await self.api.get(f'vehicle_expiration_notifications_claim.php?limit={int(limit)}')
+        jobs = data.get('jobs', [])
+        if not isinstance(jobs, list):
+            raise FinanceApiError('Resposta inválida ao buscar a fila de avisos de vencimento de veículo.')
+        return [job for job in jobs if isinstance(job, dict)]
+
+    async def complete_vexp_notification_jobs(self, results: list[dict[str, Any]]) -> None:
+        if not results:
+            return
+        await self.api.post('vehicle_expiration_notifications_complete.php', {'results': results})
+
+    async def send_vexp_notification_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        job_id = int(job.get('id', 0) or 0)
+        discord_user_id = str(job.get('recipient_discord_id', '') or '').strip()
+        message_text = str(job.get('message_text', '') or '').strip()
+        vehicle_name = str(job.get('vehicle_name', '') or 'Veículo').strip() or 'Veículo'
+        if job_id <= 0 or discord_user_id == '' or message_text == '':
+            return {'job_id': job_id, 'status': 'failed', 'error_message': 'Job inválido para envio.'}
+
+        try:
+            user = self.bot.get_user(int(discord_user_id))
+            if user is None:
+                user = await self.bot.fetch_user(int(discord_user_id))
+            sent_message = await user.send(message_text)
+            return {'job_id': job_id, 'status': 'sent', 'delivery_message_id': str(sent_message.id)}
+        except (discord.NotFound, discord.Forbidden) as exc:
+            await self.send_vexp_log(None, 'Falha ao enviar aviso de vencimento de veículo', 0xDC3545, [
+                ('Veículo', vehicle_name, True),
+                ('Discord ID', discord_user_id, True),
+                ('Erro', str(exc), False),
+            ])
+            return {'job_id': job_id, 'status': 'failed', 'error_message': str(exc)}
+        except discord.HTTPException as exc:
+            error_message = f'HTTPException: {exc}'
+            await self.send_vexp_log(None, 'Falha ao enviar aviso de vencimento de veículo', 0xDC3545, [
+                ('Veículo', vehicle_name, True),
+                ('Discord ID', discord_user_id, True),
+                ('Erro', error_message, False),
+            ])
+            return {'job_id': job_id, 'status': 'failed', 'error_message': error_message}
+
+    async def process_vexp_notification_queue(self, limit: int = 20) -> dict[str, int]:
+        jobs = await self.claim_vexp_notification_jobs(limit=limit)
+        if not jobs:
+            return {'claimed': 0, 'sent': 0, 'failed': 0}
+
+        results: list[dict[str, Any]] = []
+        sent = 0
+        failed = 0
+        for job in jobs:
+            result = await self.send_vexp_notification_job(job)
+            results.append(result)
+            if result.get('status') == 'sent':
+                sent += 1
+            else:
+                failed += 1
+
+        await self.complete_vexp_notification_jobs(results)
+        return {'claimed': len(jobs), 'sent': sent, 'failed': failed}
+
+    def vexp_panel_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title='🚗 VENCIMENTOS DE VEÍCULOS',
+            description='Painel para registrar veículos com contrato e enviar avisos automáticos antes do vencimento.',
+            color=0x6EA8FE,
+        )
+        embed.set_footer(text='Vencimentos de Veículos | ADM/GERÊNCIA')
+        return embed
+
+    async def send_vexp_panel(self, destination: discord.abc.Messageable) -> None:
+        await destination.send(embed=self.vexp_panel_embed(), view=VehicleExpirationPanelView(self))
+
+    async def publish_vexp_panel(self, interaction: discord.Interaction) -> str:
+        channel_id = int(getattr(config, 'VEHICLE_EXPIRATION_PANEL_CHANNEL_ID', 0) or 0)
+        fallback_channel = interaction.channel
+        if channel_id <= 0:
+            if fallback_channel is None:
+                raise FinanceApiError('Canal atual indisponível para enviar o painel de vencimentos de veículos.')
+            await self.send_vexp_panel(fallback_channel)
+            return 'current'
+
+        try:
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            await self.send_vexp_panel(channel)
+            return 'configured'
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            if fallback_channel is None:
+                raise FinanceApiError('O bot não conseguiu acessar o canal configurado do painel de vencimentos de veículos.')
+            await self.send_vexp_panel(fallback_channel)
+            return 'fallback'
+
+    @app_commands.command(name='painelvencimentoveiculo', description='Envia o painel de vencimentos de veículos.')
+    async def painel_vencimento_veiculo(self, interaction: discord.Interaction) -> None:
+        if not self.user_can_manage_vexp(interaction):
+            await self.send_ephemeral_message(interaction, content='Apenas ADM/gerência pode publicar o painel de vencimentos de veículos.')
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            destination = await self.publish_vexp_panel(interaction)
+        except FinanceApiError as exc:
+            await self.send_ephemeral_message(interaction, content=f'Falha ao publicar painel de vencimentos de veículos: {exc}')
+            return
+        if destination == 'configured':
+            await self.send_ephemeral_message(interaction, content='Painel de vencimentos de veículos enviado no canal configurado.')
+            return
+        await self.send_ephemeral_message(interaction, content='Painel de vencimentos de veículos enviado neste canal.')
+
+    @tasks.loop(seconds=300)
+    async def vexp_notification_loop(self) -> None:
+        try:
+            await self.enqueue_vexp_notifications(source='auto')
+            await self.process_vexp_notification_queue(limit=20)
+        except FinanceApiError as exc:
+            LOGGER.warning('Loop de notificações de vencimento de veículo adiado: %s', exc)
+        except Exception:
+            LOGGER.exception('Falha no loop de notificações de vencimento de veículo.')
+
+    @vexp_notification_loop.before_loop
+    async def before_vexp_notification_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+    # ------------------------------------------------------------------
+    # Automatic return loop — runs every 5 min, calls the PHP endpoint
+    # that force-returns all checked-out vehicles at 06:00 / 18:00 RR.
+    # ------------------------------------------------------------------
+
+    @tasks.loop(seconds=300)
+    async def auto_return_loop(self) -> None:
+        try:
+            data = await self.api.post('vehicle_auto_return.php', {})
+            returned = int(data.get('returned_count', 0) or 0)
+            if returned > 0:
+                LOGGER.info(
+                    'Auto-return RR: %d veículo(s) devolvido(s) | reset_ref=%s',
+                    returned,
+                    data.get('reset_reference', '?'),
+                )
+            # Reset backoff on success
+            self._ar_backoff = 0
+        except FinanceApiError as exc:
+            self._ar_backoff = min(getattr(self, '_ar_backoff', 0) + 1, 6)
+            wait = min(300 * (2 ** self._ar_backoff), 1800)
+            LOGGER.warning('Auto-return RR adiado (retry em %ds): %s', wait, exc)
+            await asyncio.sleep(wait)
+        except Exception:
+            LOGGER.exception('Falha no loop de auto-return de veículos.')
+
+    @auto_return_loop.before_loop
+    async def before_auto_return_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(VehicleCog(bot))

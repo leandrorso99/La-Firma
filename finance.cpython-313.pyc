@@ -1,0 +1,3170 @@
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import logging
+import re
+from typing import Any
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import config
+from services.finance_api import FinanceApiClient, FinanceApiError
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def money_text(value: float) -> str:
+    return f'R$ {value:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+
+def parse_int_input(raw: str) -> int:
+    value = raw.strip()
+    if value == '':
+        return 0
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError('Quantidade não pode ser negativa.')
+    return parsed
+
+
+def role_ids_from_config(name: str) -> set[int]:
+    values = getattr(config, name, []) or []
+    parsed: set[int] = set()
+    for value in values:
+        try:
+            role_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if role_id > 0:
+            parsed.add(role_id)
+    return parsed
+
+
+def has_any_role(member: discord.Member, role_ids: set[int]) -> bool:
+    if not role_ids:
+        return False
+    return any(role.id in role_ids for role in member.roles)
+
+
+def sanitize_channel_name(raw: str) -> str:
+    value = raw.strip().lower()
+    value = re.sub(r'[^a-z0-9]+', '-', value)
+    value = re.sub(r'-{2,}', '-', value).strip('-')
+    if not value:
+        value = 'membro'
+    return value[:70]
+
+
+def normalize_category_name(raw: str) -> str:
+    value = raw.strip().lower()
+    value = re.sub(r'\s+', ' ', value)
+    return value
+
+
+def is_ignorable_discord_http(error: Exception) -> bool:
+    if isinstance(error, discord.NotFound):
+        return True
+    if isinstance(error, discord.HTTPException):
+        return getattr(error, 'code', None) in {10003, 10062, 40060, 50027}
+    return False
+
+
+class ManagerDepositModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog', target: str = 'members') -> None:
+        super().__init__(title=cog.manager_modal_title(target))
+        self.cog = cog
+        self.target = target
+        self.inputs: dict[str, discord.ui.TextInput] = {}
+
+        for field_key, field_label in cog.manager_modal_fields(target):
+            input_item = discord.ui.TextInput(label=field_label, placeholder='0', required=False, max_length=10, default='0')
+            self.inputs[field_key] = input_item
+            self.add_item(input_item)
+
+        self.observacao: discord.ui.TextInput | None = None
+        if target == 'members':
+            self.observacao = discord.ui.TextInput(
+                label='Observação',
+                placeholder='Ex: Reposição do baú da semana',
+                required=False,
+                max_length=200,
+                style=discord.TextStyle.long,
+            )
+            self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            payload = {
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+            }
+
+            for field_key, input_item in self.inputs.items():
+                payload[field_key] = parse_int_input(str(input_item))
+
+            if self.observacao is not None:
+                payload['observacao'] = str(self.observacao).strip()
+            else:
+                payload['observacao'] = f'Entrada registrada via Discord no estoque de {self.cog.stock_target_name(self.target).lower()}'
+
+            await self.cog.handle_manager_deposit(interaction, payload, self.target)
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+        except FinanceApiError as exc:
+            if interaction.response.is_done():
+                await interaction.followup.send(f'Falha ao registrar entrada: {exc}', ephemeral=True)
+            else:
+                await interaction.response.send_message(f'Falha ao registrar entrada: {exc}', ephemeral=True)
+
+
+class CannabisRaritySelect(discord.ui.Select):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        options = [
+            discord.SelectOption(label='Incomum', value='incomum', description='Converter a maconha em Incomum'),
+            discord.SelectOption(label='Raro', value='raro', description='Converter a maconha em Raro'),
+            discord.SelectOption(label='Mítica', value='mitica', description='Converter a maconha em Mítica'),
+            discord.SelectOption(label='Lendária', value='lendaria', description='Converter a maconha em Lendária'),
+        ]
+        super().__init__(placeholder='Selecione o tipo da maconha', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await self.cog.finalize_pending_transfer(interaction, self.values[0])
+
+
+class CannabisRaritySelectView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.add_item(CannabisRaritySelect(cog, owner_user_id))
+
+
+class MemberWithdrawalCannabisTypeSelect(discord.ui.Select):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        options = [
+            discord.SelectOption(label='Comum', value='comum', description='Registrar a retirada como Comum'),
+            discord.SelectOption(label='Incomum', value='incomum', description='Registrar a retirada como Incomum'),
+            discord.SelectOption(label='Raro', value='raro', description='Registrar a retirada como Raro'),
+            discord.SelectOption(label='Mítica', value='mitica', description='Registrar a retirada como Mítica'),
+            discord.SelectOption(label='Lendária', value='lendaria', description='Registrar a retirada como Lendária'),
+        ]
+        super().__init__(placeholder='Selecione o tipo da maconha', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await self.cog.finalize_pending_member_withdrawal(interaction, self.values[0])
+
+
+class MemberWithdrawalCannabisTypeView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.add_item(MemberWithdrawalCannabisTypeSelect(cog, owner_user_id))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_member_withdrawal_payload(interaction.user.id)
+        self.cog.discard_member_withdrawal_prompt(interaction.user.id, interaction.channel_id)
+        await interaction.response.edit_message(content='Registro de retirada cancelado.', view=None)
+
+
+class TransferSourceSelect(discord.ui.Select):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        options = [
+            discord.SelectOption(label='Bangalô Membros', value='members', description='Transferir a partir do bangalô dos membros'),
+            discord.SelectOption(label='Favela', value='favela', description='Transferir a partir do baú da favela'),
+            discord.SelectOption(label='Bangalô Estoque Gerência', value='bangalo', description='Transferir a partir do estoque da gerência'),
+            discord.SelectOption(label='Bangalô 2 Estoque Gerência', value='bangalo2', description='Transferir a partir do segundo estoque da gerência'),
+            discord.SelectOption(label='Mansões', value='mansoes', description='Transferir a partir do baú de mansões'),
+        ]
+        super().__init__(placeholder='Selecione o baú de origem', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(UnifiedTransferModal(self.cog, self.values[0]))
+
+
+class TransferSourceView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.owner_user_id = owner_user_id
+        self.add_item(TransferSourceSelect(cog, owner_user_id))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.edit_message(content='Transferência cancelada.', view=None)
+
+
+class TransferDestinationSelect(discord.ui.Select):
+    def __init__(self, cog: 'StockCog', owner_user_id: int, source_scope: str) -> None:
+        labels = {
+            'members': ('Bangalô Membros', 'Bangalô Membros'),
+            'favela': ('Favela', 'Baú da Favela'),
+            'bangalo': ('Bangalô Estoque Gerência', 'Bangalô Estoque Gerência'),
+            'bangalo2': ('Bangalô 2 Estoque Gerência', 'Bangalô 2 Estoque Gerência'),
+            'mansoes': ('Mansões', 'Baú de Mansões'),
+        }
+        options = [
+            discord.SelectOption(label=label, value=value, description=description)
+            for value, (label, description) in labels.items()
+            if value != source_scope
+        ]
+        super().__init__(placeholder='Selecione o baú de destino', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await self.cog.handle_pending_transfer_destination(interaction, self.values[0])
+
+
+class TransferDestinationView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int, source_scope: str) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.add_item(TransferDestinationSelect(cog, owner_user_id, source_scope))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_transfer_request(interaction.user.id)
+        await interaction.response.edit_message(content='Transferência cancelada.', view=None)
+
+
+class CannabisTypeDecisionView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    @discord.ui.button(label='Sim', style=discord.ButtonStyle.success, emoji='✅')
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content='Selecione o tipo da maconha para concluir a transferência.',
+            view=CannabisRaritySelectView(self.cog, self.owner_user_id),
+        )
+
+    @discord.ui.button(label='Não', style=discord.ButtonStyle.secondary, emoji='➡️')
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await self.cog.finalize_pending_transfer(interaction, 'comum')
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_transfer_request(interaction.user.id)
+        await interaction.response.edit_message(content='Transferência cancelada.', view=None)
+
+
+class UnifiedTransferModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog', target: str) -> None:
+        super().__init__(title=cog.unified_transfer_modal_title(target))
+        self.cog = cog
+        self.target = target
+
+        self.maconha = discord.ui.TextInput(label='Maconha', placeholder='0', required=False, max_length=10, default='0')
+        self.cocaina = discord.ui.TextInput(label='Cocaína', placeholder='0', required=False, max_length=10, default='0')
+        self.metanfetamina = discord.ui.TextInput(label='Metanfetamina', placeholder='0', required=False, max_length=10, default='0')
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder=cog.unified_transfer_placeholder(target),
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+
+        self.add_item(self.maconha)
+        self.add_item(self.cocaina)
+        self.add_item(self.metanfetamina)
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            request = {
+                'source_scope': self.target,
+                'maconha': parse_int_input(str(self.maconha)),
+                'cocaina': parse_int_input(str(self.cocaina)),
+                'metanfetamina': parse_int_input(str(self.metanfetamina)),
+                'observacao': str(self.observacao).strip(),
+            }
+
+            if (request['maconha'] + request['cocaina'] + request['metanfetamina']) <= 0:
+                raise ValueError('Informe pelo menos uma quantidade maior que zero.')
+
+            self.cog.store_pending_transfer_request(interaction.user.id, request)
+            await interaction.response.send_message(
+                'Selecione o baú de destino da transferência.',
+                view=TransferDestinationView(self.cog, interaction.user.id, self.target),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+        except FinanceApiError as exc:
+            if interaction.response.is_done():
+                await interaction.followup.send(f'Falha ao registrar transferência: {exc}', ephemeral=True)
+            else:
+                await interaction.response.send_message(f'Falha ao registrar transferência: {exc}', ephemeral=True)
+
+
+class BangaloDepositStepTwoLauncherView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    @discord.ui.button(label='Continuar Bangalô', style=discord.ButtonStyle.success, emoji='🏡')
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(BangaloDepositStepTwoModal(self.cog))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_bangalo_payload(interaction.user.id)
+        await interaction.response.edit_message(content='Lançamento do Bangalô cancelado.', view=None)
+
+
+class BangaloDepositStepOneModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Registrar Bangalô 1/2')
+        self.cog = cog
+
+        self.maconha = discord.ui.TextInput(label='Maconha', placeholder='0', required=False, max_length=10, default='0')
+        self.cocaina = discord.ui.TextInput(label='Cocaína', placeholder='0', required=False, max_length=10, default='0')
+        self.metanfetamina = discord.ui.TextInput(label='Metanfetamina', placeholder='0', required=False, max_length=10, default='0')
+        self.comum = discord.ui.TextInput(label='Comum', placeholder='0', required=False, max_length=10, default='0')
+        self.incomum = discord.ui.TextInput(label='Incomum', placeholder='0', required=False, max_length=10, default='0')
+
+        self.add_item(self.maconha)
+        self.add_item(self.cocaina)
+        self.add_item(self.metanfetamina)
+        self.add_item(self.comum)
+        self.add_item(self.incomum)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            payload = {
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'bangalo_maconha': parse_int_input(str(self.maconha)),
+                'bangalo_cocaina': parse_int_input(str(self.cocaina)),
+                'bangalo_metanfetamina': parse_int_input(str(self.metanfetamina)),
+                'bangalo_comum': parse_int_input(str(self.comum)),
+                'bangalo_incomum': parse_int_input(str(self.incomum)),
+            }
+            self.cog.store_pending_bangalo_payload(interaction.user.id, payload)
+            await interaction.response.send_message(
+                'Parte 1 do Bangalô salva. Clique em Continuar Bangalô para informar Raro, Mítica e Lendária.',
+                view=BangaloDepositStepTwoLauncherView(self.cog, interaction.user.id),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+
+
+class BangaloDepositStepTwoModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Registrar Bangalô 2/2')
+        self.cog = cog
+
+        self.raro = discord.ui.TextInput(label='Raro', placeholder='0', required=False, max_length=10, default='0')
+        self.mitica = discord.ui.TextInput(label='Mítica', placeholder='0', required=False, max_length=10, default='0')
+        self.lendaria = discord.ui.TextInput(label='Lendária', placeholder='0', required=False, max_length=10, default='0')
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: Reposição semanal do Bangalô',
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+
+        self.add_item(self.raro)
+        self.add_item(self.mitica)
+        self.add_item(self.lendaria)
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        pending = self.cog.pop_pending_bangalo_payload(interaction.user.id)
+        if pending is None:
+            await interaction.response.send_message('A primeira etapa expirou. Abra o fluxo do Bangalô novamente.', ephemeral=True)
+            return
+
+        try:
+            payload = dict(pending)
+            payload.update({
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'bangalo_raro': parse_int_input(str(self.raro)),
+                'bangalo_mitica': parse_int_input(str(self.mitica)),
+                'bangalo_lendaria': parse_int_input(str(self.lendaria)),
+                'observacao': str(self.observacao).strip() or 'Entrada registrada via Discord no estoque do bangalô gerência',
+            })
+            await self.cog.handle_manager_deposit(interaction, payload, 'bangalo')
+        except ValueError as exc:
+            self.cog.store_pending_bangalo_payload(interaction.user.id, pending)
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+        except FinanceApiError:
+            self.cog.store_pending_bangalo_payload(interaction.user.id, pending)
+            raise
+
+
+class Bangalo2DepositStepTwoLauncherView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    @discord.ui.button(label='Continuar Bangalô 2', style=discord.ButtonStyle.success, emoji='🏠')
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(Bangalo2DepositStepTwoModal(self.cog))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_bangalo2_payload(interaction.user.id)
+        await interaction.response.edit_message(content='Lançamento do Bangalô 2 cancelado.', view=None)
+
+
+class Bangalo2DepositStepOneModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Registrar Bangalô 2 1/2')
+        self.cog = cog
+
+        self.maconha = discord.ui.TextInput(label='Maconha', placeholder='0', required=False, max_length=10, default='0')
+        self.cocaina = discord.ui.TextInput(label='Cocaína', placeholder='0', required=False, max_length=10, default='0')
+        self.metanfetamina = discord.ui.TextInput(label='Metanfetamina', placeholder='0', required=False, max_length=10, default='0')
+        self.comum = discord.ui.TextInput(label='Comum', placeholder='0', required=False, max_length=10, default='0')
+        self.incomum = discord.ui.TextInput(label='Incomum', placeholder='0', required=False, max_length=10, default='0')
+
+        self.add_item(self.maconha)
+        self.add_item(self.cocaina)
+        self.add_item(self.metanfetamina)
+        self.add_item(self.comum)
+        self.add_item(self.incomum)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            payload = {
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'bangalo2_maconha': parse_int_input(str(self.maconha)),
+                'bangalo2_cocaina': parse_int_input(str(self.cocaina)),
+                'bangalo2_metanfetamina': parse_int_input(str(self.metanfetamina)),
+                'bangalo2_comum': parse_int_input(str(self.comum)),
+                'bangalo2_incomum': parse_int_input(str(self.incomum)),
+            }
+            self.cog.store_pending_bangalo2_payload(interaction.user.id, payload)
+            await interaction.response.send_message(
+                'Parte 1 do Bangalô 2 salva. Clique em Continuar Bangalô 2 para informar Raro, Mítica e Lendária.',
+                view=Bangalo2DepositStepTwoLauncherView(self.cog, interaction.user.id),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+
+
+class Bangalo2DepositStepTwoModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Registrar Bangalô 2 2/2')
+        self.cog = cog
+
+        self.raro = discord.ui.TextInput(label='Raro', placeholder='0', required=False, max_length=10, default='0')
+        self.mitica = discord.ui.TextInput(label='Mítica', placeholder='0', required=False, max_length=10, default='0')
+        self.lendaria = discord.ui.TextInput(label='Lendária', placeholder='0', required=False, max_length=10, default='0')
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: Reposição semanal do Bangalô 2',
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+
+        self.add_item(self.raro)
+        self.add_item(self.mitica)
+        self.add_item(self.lendaria)
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        pending = self.cog.pop_pending_bangalo2_payload(interaction.user.id)
+        if pending is None:
+            await interaction.response.send_message('A primeira etapa expirou. Abra o fluxo do Bangalô 2 novamente.', ephemeral=True)
+            return
+
+        try:
+            payload = dict(pending)
+            payload.update({
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'bangalo2_raro': parse_int_input(str(self.raro)),
+                'bangalo2_mitica': parse_int_input(str(self.mitica)),
+                'bangalo2_lendaria': parse_int_input(str(self.lendaria)),
+                'observacao': str(self.observacao).strip() or 'Entrada registrada via Discord no estoque do bangalô 2 gerência',
+            })
+            await self.cog.handle_manager_deposit(interaction, payload, 'bangalo2')
+        except ValueError as exc:
+            self.cog.store_pending_bangalo2_payload(interaction.user.id, pending)
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+        except FinanceApiError:
+            self.cog.store_pending_bangalo2_payload(interaction.user.id, pending)
+            raise
+
+
+class MembersDepositStepTwoLauncherView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    @discord.ui.button(label='Continuar Membros', style=discord.ButtonStyle.success, emoji='🧰')
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(MembersDepositStepTwoModal(self.cog))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_members_payload(interaction.user.id)
+        await interaction.response.edit_message(content='Lançamento do bangalô membros cancelado.', view=None)
+
+
+class MembersDepositStepOneModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Transferir Membros -> Favela 1/2')
+        self.cog = cog
+
+        self.cocaina = discord.ui.TextInput(label='Cocaína', placeholder='0', required=False, max_length=10, default='0')
+        self.metanfetamina = discord.ui.TextInput(label='Metanfetamina', placeholder='0', required=False, max_length=10, default='0')
+        self.comum = discord.ui.TextInput(label='Comum', placeholder='0', required=False, max_length=10, default='0')
+        self.incomum = discord.ui.TextInput(label='Incomum', placeholder='0', required=False, max_length=10, default='0')
+
+        self.add_item(self.cocaina)
+        self.add_item(self.metanfetamina)
+        self.add_item(self.comum)
+        self.add_item(self.incomum)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            payload = {
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'cocaina': parse_int_input(str(self.cocaina)),
+                'metanfetamina': parse_int_input(str(self.metanfetamina)),
+                'membros_comum': parse_int_input(str(self.comum)),
+                'membros_incomum': parse_int_input(str(self.incomum)),
+            }
+            self.cog.store_pending_members_payload(interaction.user.id, payload)
+            await interaction.response.send_message(
+                'Parte 1 da transferência dos membros para a favela salva. Clique em Continuar Membros para informar Raro, Mítica e Lendária.',
+                view=MembersDepositStepTwoLauncherView(self.cog, interaction.user.id),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+
+
+class MembersDepositStepTwoModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Transferir Membros -> Favela 2/2')
+        self.cog = cog
+
+        self.raro = discord.ui.TextInput(label='Raro', placeholder='0', required=False, max_length=10, default='0')
+        self.mitica = discord.ui.TextInput(label='Mítica', placeholder='0', required=False, max_length=10, default='0')
+        self.lendaria = discord.ui.TextInput(label='Lendária', placeholder='0', required=False, max_length=10, default='0')
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: Transferência do bangalô membros para reabastecer a favela',
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+
+        self.add_item(self.raro)
+        self.add_item(self.mitica)
+        self.add_item(self.lendaria)
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        pending = self.cog.pop_pending_members_payload(interaction.user.id)
+        if pending is None:
+            await interaction.response.send_message('A primeira etapa expirou. Abra a transferência dos membros novamente.', ephemeral=True)
+            return
+
+        try:
+            payload = dict(pending)
+            payload.update({
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'membros_raro': parse_int_input(str(self.raro)),
+                'membros_mitica': parse_int_input(str(self.mitica)),
+                'membros_lendaria': parse_int_input(str(self.lendaria)),
+                'observacao': str(self.observacao).strip() or 'Transferência registrada via Discord do bangalô membros para a favela',
+            })
+            await self.cog.handle_manager_deposit(interaction, payload, 'members')
+        except ValueError as exc:
+            self.cog.store_pending_members_payload(interaction.user.id, pending)
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+        except FinanceApiError:
+            self.cog.store_pending_members_payload(interaction.user.id, pending)
+            raise
+
+
+class FavelaTransferStepTwoLauncherView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    @discord.ui.button(label='Continuar Favela', style=discord.ButtonStyle.success, emoji='🌿')
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(FavelaTransferStepTwoModal(self.cog))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_favela_payload(interaction.user.id)
+        await interaction.response.edit_message(content='Transferência da Favela cancelada.', view=None)
+
+
+class FavelaTransferStepOneModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Reabastecer Favela 1/2')
+        self.cog = cog
+
+        self.cocaina = discord.ui.TextInput(label='Cocaína', placeholder='0', required=False, max_length=10, default='0')
+        self.metanfetamina = discord.ui.TextInput(label='Metanfetamina', placeholder='0', required=False, max_length=10, default='0')
+        self.comum = discord.ui.TextInput(label='Comum', placeholder='0', required=False, max_length=10, default='0')
+        self.incomum = discord.ui.TextInput(label='Incomum', placeholder='0', required=False, max_length=10, default='0')
+        self.raro = discord.ui.TextInput(label='Raro', placeholder='0', required=False, max_length=10, default='0')
+
+        self.add_item(self.cocaina)
+        self.add_item(self.metanfetamina)
+        self.add_item(self.comum)
+        self.add_item(self.incomum)
+        self.add_item(self.raro)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            payload = {
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'favela_cocaina': parse_int_input(str(self.cocaina)),
+                'favela_metanfetamina': parse_int_input(str(self.metanfetamina)),
+                'comum': parse_int_input(str(self.comum)),
+                'incomum': parse_int_input(str(self.incomum)),
+                'raro': parse_int_input(str(self.raro)),
+            }
+            self.cog.store_pending_favela_payload(interaction.user.id, payload)
+            await interaction.response.send_message(
+                'Parte 1 do reabastecimento da Favela salva. Clique em Continuar Favela para informar Mítica e Lendária.',
+                view=FavelaTransferStepTwoLauncherView(self.cog, interaction.user.id),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+
+
+class FavelaTransferStepTwoModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Reabastecer Favela 2/2')
+        self.cog = cog
+
+        self.mitica = discord.ui.TextInput(label='Mítica', placeholder='0', required=False, max_length=10, default='0')
+        self.lendaria = discord.ui.TextInput(label='Lendária', placeholder='0', required=False, max_length=10, default='0')
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: Reabastecimento direto do baú da favela',
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+
+        self.add_item(self.mitica)
+        self.add_item(self.lendaria)
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        pending = self.cog.pop_pending_favela_payload(interaction.user.id)
+        if pending is None:
+            await interaction.response.send_message('A primeira etapa expirou. Abra a transferência da Favela novamente.', ephemeral=True)
+            return
+
+        try:
+            payload = dict(pending)
+            payload.update({
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'mitica': parse_int_input(str(self.mitica)),
+                'lendaria': parse_int_input(str(self.lendaria)),
+                'observacao': str(self.observacao).strip() or 'Reabastecimento registrado via Discord no baú da favela',
+            })
+            await self.cog.handle_manager_deposit(interaction, payload, 'favela')
+        except ValueError as exc:
+            self.cog.store_pending_favela_payload(interaction.user.id, pending)
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+        except FinanceApiError:
+            self.cog.store_pending_favela_payload(interaction.user.id, pending)
+            raise
+
+
+class MansoesTransferStepTwoLauncherView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    @discord.ui.button(label='Continuar Mansões', style=discord.ButtonStyle.success, emoji='🏘️')
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(MansoesTransferStepTwoModal(self.cog))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_mansoes_payload(interaction.user.id)
+        await interaction.response.edit_message(content='Transferência de Mansões cancelada.', view=None)
+
+
+class MansoesTransferStepOneModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Transferir Mansões -> Favela 1/2')
+        self.cog = cog
+
+        self.cocaina = discord.ui.TextInput(label='Cocaína', placeholder='0', required=False, max_length=10, default='0')
+        self.metanfetamina = discord.ui.TextInput(label='Metanfetamina', placeholder='0', required=False, max_length=10, default='0')
+        self.comum = discord.ui.TextInput(label='Comum', placeholder='0', required=False, max_length=10, default='0')
+        self.incomum = discord.ui.TextInput(label='Incomum', placeholder='0', required=False, max_length=10, default='0')
+        self.raro = discord.ui.TextInput(label='Raro', placeholder='0', required=False, max_length=10, default='0')
+
+        self.add_item(self.cocaina)
+        self.add_item(self.metanfetamina)
+        self.add_item(self.comum)
+        self.add_item(self.incomum)
+        self.add_item(self.raro)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            payload = {
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'mansoes_cocaina': parse_int_input(str(self.cocaina)),
+                'mansoes_metanfetamina': parse_int_input(str(self.metanfetamina)),
+                'mansoes_comum': parse_int_input(str(self.comum)),
+                'mansoes_incomum': parse_int_input(str(self.incomum)),
+                'mansoes_raro': parse_int_input(str(self.raro)),
+            }
+            self.cog.store_pending_mansoes_payload(interaction.user.id, payload)
+            await interaction.response.send_message(
+                'Parte 1 da transferência de Mansões para a Favela salva. Clique em Continuar Mansões para informar Mítica e Lendária.',
+                view=MansoesTransferStepTwoLauncherView(self.cog, interaction.user.id),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+
+
+class MansoesTransferStepTwoModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Transferir Mansões -> Favela 2/2')
+        self.cog = cog
+
+        self.mitica = discord.ui.TextInput(label='Mítica', placeholder='0', required=False, max_length=10, default='0')
+        self.lendaria = discord.ui.TextInput(label='Lendária', placeholder='0', required=False, max_length=10, default='0')
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: Transferência de mansões para reabastecer a favela',
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+
+        self.add_item(self.mitica)
+        self.add_item(self.lendaria)
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        pending = self.cog.pop_pending_mansoes_payload(interaction.user.id)
+        if pending is None:
+            await interaction.response.send_message('A primeira etapa expirou. Abra a transferência de Mansões novamente.', ephemeral=True)
+            return
+
+        try:
+            payload = dict(pending)
+            payload.update({
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'mansoes_mitica': parse_int_input(str(self.mitica)),
+                'mansoes_lendaria': parse_int_input(str(self.lendaria)),
+                'observacao': str(self.observacao).strip() or 'Transferência registrada via Discord do baú de mansões para a favela',
+            })
+            await self.cog.handle_manager_deposit(interaction, payload, 'mansoes')
+        except ValueError as exc:
+            self.cog.store_pending_mansoes_payload(interaction.user.id, pending)
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+        except FinanceApiError:
+            self.cog.store_pending_mansoes_payload(interaction.user.id, pending)
+            raise
+
+
+class MemberWithdrawalModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(title='Registrar Retirada')
+        self.cog = cog
+
+        self.comum = discord.ui.TextInput(label='Maconha', placeholder='0', required=False, max_length=10, default='0')
+        self.cocaina = discord.ui.TextInput(label='Cocaína', placeholder='0', required=False, max_length=10, default='0')
+        self.metanfetamina = discord.ui.TextInput(label='Metanfetamina', placeholder='0', required=False, max_length=10, default='0')
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: retirada da rota',
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+
+        self.add_item(self.comum)
+        self.add_item(self.cocaina)
+        self.add_item(self.metanfetamina)
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            maconha_qty = parse_int_input(str(self.comum))
+            payload = {
+                'autor': interaction.user.display_name,
+                'autor_discord_id': str(interaction.user.id),
+                'ticket_channel_id': str(interaction.channel_id),
+                'maconha': maconha_qty,
+                'cocaina': parse_int_input(str(self.cocaina)),
+                'metanfetamina': parse_int_input(str(self.metanfetamina)),
+                'observacao': str(self.observacao).strip(),
+            }
+
+            if maconha_qty > 0:
+                await self.cog.clear_member_withdrawal_prompt(
+                    interaction.user.id,
+                    interaction.channel_id,
+                    content='Seleção anterior de tipo de maconha substituída por um novo registro.',
+                )
+                self.cog.store_pending_member_withdrawal_payload(interaction.user.id, payload)
+                await interaction.response.send_message(
+                    'Selecione o tipo da maconha retirada do baú dos membros.',
+                    view=MemberWithdrawalCannabisTypeView(self.cog, interaction.user.id),
+                    ephemeral=True,
+                )
+                try:
+                    prompt_message = await interaction.original_response()
+                except (discord.NotFound, discord.HTTPException):
+                    prompt_message = None
+                if prompt_message is not None:
+                    self.cog.store_member_withdrawal_prompt(interaction.user.id, interaction.channel_id, prompt_message)
+                return
+
+            await self.cog.handle_member_withdrawal(interaction, payload)
+        except ValueError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Entrada inválida: {exc}')
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(
+                interaction,
+                content=self.cog.stock_action_error_message('registrar retirada', exc),
+            )
+
+
+class SampleInfoModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog', member_name: str) -> None:
+        super().__init__(title='Registrar Amostra')
+        self.cog = cog
+
+        self.member_name = discord.ui.TextInput(label='Membro', required=True, max_length=150, default=member_name)
+
+        self.add_item(self.member_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        request = {
+            'member_name': str(self.member_name).strip(),
+            'observacao': '',
+            'items': [],
+        }
+        self.cog.store_pending_sample_request(interaction.user.id, request)
+        await interaction.response.send_message(
+            self.cog.sample_builder_content(request),
+            view=SampleBuilderView(self.cog, interaction.user.id),
+            ephemeral=True,
+        )
+
+
+class SampleObservationModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(title='Observação da Amostra')
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.observacao = discord.ui.TextInput(
+            label='Observação',
+            placeholder='Ex: amostra para teste interno',
+            required=True,
+            max_length=200,
+            style=discord.TextStyle.long,
+        )
+        self.add_item(self.observacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        request = self.cog.pending_sample_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.send_message('Registro de amostra expirado.', ephemeral=True)
+            return
+        request['observacao'] = str(self.observacao).strip()
+        self.cog.store_pending_sample_request(interaction.user.id, request)
+        await self.cog.finalize_pending_sample_request(interaction, self.owner_user_id)
+
+
+class SampleObservationPromptView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    @discord.ui.button(label='Sim', style=discord.ButtonStyle.primary, emoji='📝')
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(SampleObservationModal(self.cog, self.owner_user_id))
+
+    @discord.ui.button(label='Não', style=discord.ButtonStyle.success, emoji='✅')
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await self.cog.finalize_pending_sample_request(interaction, self.owner_user_id)
+
+    @discord.ui.button(label='Voltar', style=discord.ButtonStyle.secondary, emoji='↩')
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        request = self.cog.pending_sample_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.edit_message(content='Registro de amostra expirado.', view=None)
+            return
+        await interaction.response.edit_message(content=self.cog.sample_builder_content(request), view=SampleBuilderView(self.cog, self.owner_user_id))
+
+
+class SampleDrugSelect(discord.ui.Select):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        options = [
+            discord.SelectOption(label='Maconha', value='maconha', description='Adicionar maconha à amostra'),
+            discord.SelectOption(label='Cocaína', value='cocaina', description='Adicionar cocaína à amostra'),
+            discord.SelectOption(label='Metanfetamina', value='metanfetamina', description='Adicionar metanfetamina à amostra'),
+        ]
+        super().__init__(placeholder='Selecione a droga do item', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_modal(SampleQuantityModal(self.cog, self.values[0]))
+
+
+class SampleDrugSelectionView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.add_item(SampleDrugSelect(cog, owner_user_id))
+
+    @discord.ui.button(label='Voltar', style=discord.ButtonStyle.secondary, emoji='↩')
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        request = self.cog.pending_sample_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.edit_message(content='Registro de amostra expirado.', view=None)
+            return
+        await interaction.response.edit_message(content=self.cog.sample_builder_content(request), view=SampleBuilderView(self.cog, self.owner_user_id))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_sample_request(interaction.user.id)
+        await interaction.response.edit_message(content='Registro de amostra cancelado.', view=None)
+
+
+class SampleQuantityModal(discord.ui.Modal):
+    def __init__(self, cog: 'StockCog', drug_type: str) -> None:
+        super().__init__(title='Quantidade do Item')
+        self.cog = cog
+        self.drug_type = drug_type
+
+        self.quantity = discord.ui.TextInput(label='Quantidade', placeholder='0', required=True, max_length=10, default='0')
+        self.add_item(self.quantity)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            quantity = parse_int_input(str(self.quantity))
+            if quantity <= 0:
+                raise ValueError('Informe uma quantidade maior que zero.')
+
+            request = self.cog.pending_sample_requests.get(interaction.user.id)
+            if request is None:
+                await interaction.response.send_message('O fluxo expirou. Abra o registro novamente.', ephemeral=True)
+                return
+
+            request['draft_item'] = {
+                'drug_type': self.drug_type,
+                'quantity': quantity,
+            }
+            self.cog.store_pending_sample_request(interaction.user.id, request)
+
+            if self.drug_type in {'maconha', 'cocaina'}:
+                await interaction.response.send_message(
+                    'Selecione a raridade do item.',
+                    view=SampleRaritySelectionView(self.cog, interaction.user.id),
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.send_message(
+                'Selecione o baú de origem do item.',
+                view=SampleSourceSelectionView(self.cog, interaction.user.id),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f'Entrada inválida: {exc}', ephemeral=True)
+
+
+class SampleRaritySelect(discord.ui.Select):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        options = [
+            discord.SelectOption(label='Comum', value='comum'),
+            discord.SelectOption(label='Incomum', value='incomum'),
+            discord.SelectOption(label='Raro', value='raro'),
+            discord.SelectOption(label='Mítica', value='mitica'),
+            discord.SelectOption(label='Lendária', value='lendaria'),
+        ]
+        super().__init__(placeholder='Selecione a raridade', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await self.cog.handle_pending_sample_rarity(interaction, self.values[0])
+
+
+class SampleRaritySelectionView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.add_item(SampleRaritySelect(cog, owner_user_id))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_sample_request(interaction.user.id)
+        await interaction.response.edit_message(content='Registro de amostra cancelado.', view=None)
+
+
+class SampleSourceSelect(discord.ui.Select):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        options = [
+            discord.SelectOption(label='Favela', value='favela', description='Baú da Favela'),
+            discord.SelectOption(label='Bangalô Estoque Gerência', value='bangalo', description='Baú do estoque da gerência'),
+            discord.SelectOption(label='Bangalô 2 Estoque Gerência', value='bangalo2', description='Baú do segundo estoque da gerência'),
+            discord.SelectOption(label='Mansões', value='mansoes', description='Baú das Mansões'),
+            discord.SelectOption(label='Bangalô Membros', value='members', description='Estoque dos membros no bangalô'),
+        ]
+        super().__init__(placeholder='Selecione o baú de origem', min_values=1, max_values=1, options=options)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        await self.cog.handle_pending_sample_source(interaction, self.values[0])
+
+
+class SampleSourceSelectionView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.add_item(SampleSourceSelect(cog, owner_user_id))
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_sample_request(interaction.user.id)
+        await interaction.response.edit_message(content='Registro de amostra cancelado.', view=None)
+
+
+class SampleBuilderView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    @discord.ui.button(label='Adicionar Item', style=discord.ButtonStyle.primary, emoji='➕')
+    async def add_item_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        request = self.cog.pending_sample_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.edit_message(content='Registro de amostra expirado.', view=None)
+            return
+        await interaction.response.edit_message(content=self.cog.sample_builder_content(request, prefix='Selecione a droga do próximo item.'), view=SampleDrugSelectionView(self.cog, self.owner_user_id))
+
+    @discord.ui.button(label='Finalizar', style=discord.ButtonStyle.success, emoji='✅')
+    async def finish_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        request = self.cog.pending_sample_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.edit_message(content='Registro de amostra expirado.', view=None)
+            return
+        items = request.get('items', []) if isinstance(request.get('items'), list) else []
+        if not items:
+            await interaction.response.send_message('Adicione pelo menos um item antes de finalizar.', ephemeral=True)
+            return
+
+        if not str(request.get('observacao', '')).strip():
+            await interaction.response.edit_message(
+                content=self.cog.sample_builder_content(request, prefix='Deseja adicionar alguma observação antes de finalizar?'),
+                view=SampleObservationPromptView(self.cog, self.owner_user_id),
+            )
+            return
+
+        await self.cog.finalize_pending_sample_request(interaction, self.owner_user_id)
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.danger, emoji='✖')
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message('Esse fluxo pertence a outra pessoa.', ephemeral=True)
+            return
+        self.cog.discard_pending_sample_request(interaction.user.id)
+        await interaction.response.edit_message(content='Registro de amostra cancelado.', view=None)
+
+
+class StockTicketView(discord.ui.View):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        LOGGER.exception('Erro em StockTicketView no item %s', getattr(item, 'custom_id', None), exc_info=error)
+        if is_ignorable_discord_http(error):
+            return
+        await self.cog.send_ephemeral_message(
+            interaction,
+            content='Falha ao processar esta interação. Tente novamente em instantes.',
+        )
+
+    @discord.ui.button(label='Registrar Retirada', style=discord.ButtonStyle.primary, emoji='📦', custom_id='stock:ticket:withdraw')
+    async def withdraw_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.send_modal_safely(interaction, MemberWithdrawalModal(self.cog))
+
+    @discord.ui.button(label='Registrar Amostra', style=discord.ButtonStyle.secondary, emoji='🎁', custom_id='stock:ticket:sample')
+    async def sample_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.send_modal_safely(interaction, SampleInfoModal(self.cog, interaction.user.display_name))
+
+    @discord.ui.button(label='Fechar Ticket', style=discord.ButtonStyle.danger, emoji='🔒', custom_id='stock:ticket:close')
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.handle_close_ticket(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao fechar ticket: {exc}')
+
+
+class StockPanelView(discord.ui.View):
+    def __init__(self, cog: 'StockCog') -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        LOGGER.exception('Erro em StockPanelView no item %s', getattr(item, 'custom_id', None), exc_info=error)
+        if is_ignorable_discord_http(error):
+            return
+        await self.cog.send_ephemeral_message(
+            interaction,
+            content='Falha ao processar esta interação. Tente novamente em instantes.',
+        )
+
+    @discord.ui.button(label='Registrar (Membro)', style=discord.ButtonStyle.primary, emoji='🎫', custom_id='stock:panel:member', row=0)
+    async def member_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            await self.cog.handle_member_ticket_open(interaction)
+        except (FinanceApiError, discord.Forbidden, discord.HTTPException) as exc:
+            if isinstance(exc, discord.HTTPException) and getattr(exc, 'code', None) in {40060, 10062}:
+                return
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao abrir ticket: {exc}')
+        except Exception as exc:
+            LOGGER.exception('Erro inesperado ao abrir ticket pelo painel', exc_info=exc)
+            await self.cog.send_ephemeral_message(interaction, content='Erro inesperado ao abrir ticket. Tente novamente em instantes.')
+
+    @discord.ui.button(label='Transferência de Estoque', style=discord.ButtonStyle.success, emoji='🔁', custom_id='stock:panel:manager-transfer', row=0)
+    async def manager_transfer_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            if not self.cog.can_manage_stock(interaction):
+                await self.cog.send_ephemeral_message(interaction, content='Somente a gerência pode registrar transferências entre os baús.')
+                return
+            await self.cog.send_ephemeral_message(interaction, content='Selecione o baú de origem da transferência.', view=TransferSourceView(self.cog, interaction.user.id))
+        except Exception as exc:
+            LOGGER.exception('Erro inesperado ao abrir fluxo de transferência', exc_info=exc)
+            await self.cog.send_ephemeral_message(interaction, content='Erro inesperado ao abrir a transferência. Tente novamente em instantes.')
+
+    @discord.ui.button(label='Histórico Semanal', style=discord.ButtonStyle.secondary, emoji='📊', custom_id='stock:panel:weekly', row=0)
+    async def weekly_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.can_manage_stock(interaction):
+            await self.cog.send_ephemeral_message(interaction, content='Somente a gerência pode consultar o histórico semanal.')
+            return
+        try:
+            await self.cog.handle_weekly_history(interaction)
+        except FinanceApiError as exc:
+            await self.cog.send_ephemeral_message(interaction, content=f'Falha ao consultar histórico: {exc}')
+        except Exception as exc:
+            LOGGER.exception('Erro inesperado ao consultar histórico semanal', exc_info=exc)
+            await self.cog.send_ephemeral_message(interaction, content='Erro inesperado ao consultar o histórico semanal. Tente novamente em instantes.')
+
+    @discord.ui.button(label='Entrada Bangalô 2', style=discord.ButtonStyle.primary, emoji='🏠', custom_id='stock:panel:manager-bangalo2', row=1)
+    async def manager_bangalo2_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            if not self.cog.can_manage_stock(interaction):
+                await self.cog.send_ephemeral_message(interaction, content='Somente a gerência pode registrar entradas no Bangalô 2.')
+                return
+            await self.cog.send_modal_safely(interaction, Bangalo2DepositStepOneModal(self.cog))
+        except Exception as exc:
+            LOGGER.exception('Erro inesperado ao abrir fluxo de entrada do Bangalô 2', exc_info=exc)
+            await self.cog.send_ephemeral_message(interaction, content='Erro inesperado ao abrir a entrada do Bangalô 2. Tente novamente em instantes.')
+
+
+class StockResetScopeView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    async def handle_reset(self, interaction: discord.Interaction, scope: str) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse menu pertence a outra pessoa.', ephemeral=True)
+            return
+
+        try:
+            await self.cog.handle_stock_reset_scope(interaction, scope)
+        except FinanceApiError as exc:
+            if interaction.response.is_done():
+                await interaction.followup.send(f'Falha ao zerar estoque: {exc}', ephemeral=True)
+            else:
+                await interaction.response.send_message(f'Falha ao zerar estoque: {exc}', ephemeral=True)
+
+    @discord.ui.button(label='Todos os Baús', style=discord.ButtonStyle.danger, emoji='🗑️', row=0)
+    async def reset_all_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.handle_reset(interaction, 'all')
+
+    @discord.ui.button(label='Baú Membros', style=discord.ButtonStyle.danger, emoji='🧰', row=0)
+    async def reset_members_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.handle_reset(interaction, 'members')
+
+    @discord.ui.button(label='Baú Favela', style=discord.ButtonStyle.danger, emoji='🌿', row=0)
+    async def reset_favela_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.handle_reset(interaction, 'favela')
+
+    @discord.ui.button(label='Baú Mansões', style=discord.ButtonStyle.danger, emoji='🏘️', row=1)
+    async def reset_mansoes_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.handle_reset(interaction, 'mansoes')
+
+    @discord.ui.button(label='Baú Bangalô', style=discord.ButtonStyle.danger, emoji='🏡', row=1)
+    async def reset_bangalo_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.handle_reset(interaction, 'bangalo')
+
+    @discord.ui.button(label='Baú Bangalô 2', style=discord.ButtonStyle.danger, emoji='🏠', row=1)
+    async def reset_bangalo2_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.handle_reset(interaction, 'bangalo2')
+
+    @discord.ui.button(label='Cancelar', style=discord.ButtonStyle.secondary, emoji='✖', row=2)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse menu pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.edit_message(content='Ação cancelada.', view=None)
+
+
+class WeeklyHistoryView(discord.ui.View):
+    def __init__(self, cog: 'StockCog', owner_user_id: int, pages: list[str]) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.pages = pages
+        self.index = 0
+        self._sync_buttons()
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_user_id
+
+    def _sync_buttons(self) -> None:
+        self.previous_button.disabled = self.index <= 0
+        self.next_button.disabled = self.index >= len(self.pages) - 1
+
+    def current_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f'📊 Painel Financeiro e Estoque - Pág {self.index + 1}/{len(self.pages)}',
+            description=self.pages[self.index],
+            color=0xF1C40F,
+        )
+        return embed
+
+    @discord.ui.button(label='◀ Anterior', style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse painel pertence a outra pessoa.', ephemeral=True)
+            return
+        self.index = max(0, self.index - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='Próximo ▶', style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse painel pertence a outra pessoa.', ephemeral=True)
+            return
+        self.index = min(len(self.pages) - 1, self.index + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='🗑 Zerar Estoque', style=discord.ButtonStyle.danger)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.can_use(interaction):
+            await interaction.response.send_message('Esse painel pertence a outra pessoa.', ephemeral=True)
+            return
+        await interaction.response.send_message(
+            'Escolha qual estoque deseja zerar.',
+            view=StockResetScopeView(self.cog, self.owner_user_id),
+            ephemeral=True,
+        )
+
+
+class StockCog(commands.Cog):
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self.api = FinanceApiClient()
+        self.pending_transfer_requests: dict[int, dict[str, Any]] = {}
+        self.pending_sample_requests: dict[int, dict[str, Any]] = {}
+        self.pending_member_withdrawals: dict[int, dict[str, Any]] = {}
+        self.pending_member_withdrawal_prompts: dict[tuple[int, int], discord.Message | discord.InteractionMessage | discord.WebhookMessage] = {}
+        self.pending_members_deposits: dict[int, dict[str, Any]] = {}
+        self.pending_favela_deposits: dict[int, dict[str, Any]] = {}
+        self.pending_mansoes_deposits: dict[int, dict[str, Any]] = {}
+        self.pending_bangalo_deposits: dict[int, dict[str, Any]] = {}
+        self.pending_bangalo2_deposits: dict[int, dict[str, Any]] = {}
+        self.guild_object = None
+        guild_id = int(getattr(config, 'GUILD_ID', 0) or 0)
+        if guild_id > 0:
+            self.guild_object = discord.Object(id=guild_id)
+
+    async def cog_load(self) -> None:
+        self.bot.add_view(StockPanelView(self))
+        self.bot.add_view(StockTicketView(self))
+
+    async def cog_unload(self) -> None:
+        await self.api.close()
+
+    def audit_log_delete_after(self) -> float | None:
+        raw_value = getattr(config, 'STOCK_LOG_DELETE_AFTER_SECONDS', 600)
+        try:
+            seconds = float(raw_value)
+        except (TypeError, ValueError):
+            seconds = 600.0
+
+        if seconds <= 0:
+            return None
+
+        return seconds
+
+    def ephemeral_delete_after(self) -> float | None:
+        raw_value = getattr(config, 'STOCK_EPHEMERAL_DELETE_AFTER_SECONDS', 120)
+        try:
+            seconds = float(raw_value)
+        except (TypeError, ValueError):
+            seconds = 120.0
+
+        if seconds <= 0:
+            return None
+
+        return seconds
+
+    def stock_action_error_message(self, action_label: str, error: Exception) -> str:
+        raw_message = str(error).strip() or 'erro desconhecido.'
+        normalized = raw_message.casefold()
+
+        if 'não existe ticket aberto vinculado a este canal' in normalized:
+            return (
+                f'Falha ao {action_label}: este canal não está vinculado a um ticket aberto no site.\n'
+                'Abra um ticket novo pelo painel de retirada e faça o lançamento dentro do ticket.'
+            )
+
+        if 'somente o dono do ticket pode registrar a retirada' in normalized or 'somente o dono do ticket pode registrar a amostra' in normalized:
+            return (
+                f'Falha ao {action_label}: apenas o dono do ticket pode concluir esse lançamento.\n'
+                'Peça para o próprio membro registrar no ticket dele.'
+            )
+
+        if 'dados obrigatórios da retirada não foram enviados' in normalized:
+            return (
+                f'Falha ao {action_label}: dados obrigatórios não chegaram na API.\n'
+                'Feche este fluxo e tente registrar novamente pelo botão do ticket.'
+            )
+
+        if 'dados obrigatórios da amostra não foram enviados' in normalized:
+            return (
+                f'Falha ao {action_label}: dados obrigatórios da amostra não chegaram na API.\n'
+                'Abra o fluxo de amostra novamente no ticket e confirme os campos.'
+            )
+
+        return f'Falha ao {action_label}: {raw_message}'
+
+    async def delete_message_later(self, message: discord.Message | discord.InteractionMessage | discord.WebhookMessage | None, delay: float | None) -> None:
+        if message is None or delay is None:
+            return
+
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    async def send_ephemeral_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        delete_after = self.ephemeral_delete_after()
+        kwargs: dict[str, Any] = {'ephemeral': True}
+
+        if content is not None:
+            kwargs['content'] = content
+        if embed is not None:
+            kwargs['embed'] = embed
+        if view is not None:
+            kwargs['view'] = view
+
+        if interaction.response.is_done():
+            try:
+                message = await interaction.followup.send(wait=True, **kwargs)
+            except Exception as exc:
+                if is_ignorable_discord_http(exc):
+                    return
+                raise
+            if message is None:
+                return
+            if delete_after is not None:
+                asyncio.create_task(self.delete_message_later(message, delete_after))
+            return
+
+        try:
+            await interaction.response.send_message(**kwargs)
+        except Exception as exc:
+            if not is_ignorable_discord_http(exc):
+                raise
+            try:
+                message = await interaction.followup.send(wait=True, **kwargs)
+            except Exception as followup_exc:
+                if is_ignorable_discord_http(followup_exc):
+                    return
+                raise
+            if message is None:
+                return
+            if delete_after is not None:
+                asyncio.create_task(self.delete_message_later(message, delete_after))
+            return
+        if delete_after is not None:
+            try:
+                message = await interaction.original_response()
+            except (discord.NotFound, discord.HTTPException):
+                return
+            asyncio.create_task(self.delete_message_later(message, delete_after))
+
+    async def send_modal_safely(self, interaction: discord.Interaction, modal: discord.ui.Modal) -> bool:
+        if interaction.response.is_done():
+            await self.send_ephemeral_message(
+                interaction,
+                content='Essa interação já expirou. Clique no botão novamente para abrir o formulário.',
+            )
+            return False
+        try:
+            await interaction.response.send_modal(modal)
+            return True
+        except Exception as exc:
+            if is_ignorable_discord_http(exc):
+                await self.send_ephemeral_message(
+                    interaction,
+                    content='Essa interação já expirou. Clique no botão novamente para abrir o formulário.',
+                )
+                return False
+            raise
+
+    async def defer_ephemeral_safely(self, interaction: discord.Interaction, *, thinking: bool = False) -> bool:
+        if interaction.response.is_done():
+            return True
+
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=thinking)
+            return True
+        except Exception as exc:
+            if is_ignorable_discord_http(exc):
+                return False
+            raise
+
+    def manager_role_ids(self) -> set[int]:
+        return role_ids_from_config('STOCK_MANAGER_ROLE_IDS')
+
+    def support_role_ids(self) -> set[int]:
+        return role_ids_from_config('STOCK_SUPPORT_ROLE_IDS') | self.manager_role_ids() | self.close_role_ids()
+
+    def store_pending_transfer_request(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_transfer_requests[user_id] = payload
+
+    def pop_pending_transfer_request(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_transfer_requests.pop(user_id, None)
+
+    def discard_pending_transfer_request(self, user_id: int) -> None:
+        self.pending_transfer_requests.pop(user_id, None)
+
+    def store_pending_sample_request(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_sample_requests[user_id] = payload
+
+    def pop_pending_sample_request(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_sample_requests.pop(user_id, None)
+
+    def discard_pending_sample_request(self, user_id: int) -> None:
+        self.pending_sample_requests.pop(user_id, None)
+
+    def store_pending_member_withdrawal_payload(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_member_withdrawals[user_id] = payload
+
+    def pop_pending_member_withdrawal_payload(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_member_withdrawals.pop(user_id, None)
+
+    def discard_pending_member_withdrawal_payload(self, user_id: int) -> None:
+        self.pending_member_withdrawals.pop(user_id, None)
+
+    def member_withdrawal_prompt_key(self, user_id: int, channel_id: int | None) -> tuple[int, int] | None:
+        if channel_id is None:
+            return None
+        return (user_id, int(channel_id))
+
+    def store_member_withdrawal_prompt(
+        self,
+        user_id: int,
+        channel_id: int | None,
+        message: discord.Message | discord.InteractionMessage | discord.WebhookMessage,
+    ) -> None:
+        key = self.member_withdrawal_prompt_key(user_id, channel_id)
+        if key is None:
+            return
+        self.pending_member_withdrawal_prompts[key] = message
+
+    def discard_member_withdrawal_prompt(self, user_id: int, channel_id: int | None) -> None:
+        key = self.member_withdrawal_prompt_key(user_id, channel_id)
+        if key is None:
+            return
+        self.pending_member_withdrawal_prompts.pop(key, None)
+
+    async def clear_member_withdrawal_prompt(self, user_id: int, channel_id: int | None, *, content: str | None = None) -> None:
+        key = self.member_withdrawal_prompt_key(user_id, channel_id)
+        if key is None:
+            return
+        message = self.pending_member_withdrawal_prompts.pop(key, None)
+        if message is None:
+            return
+        try:
+            await message.edit(content=content or 'Seleção de tipo de maconha expirada.', view=None)
+        except Exception as exc:
+            if is_ignorable_discord_http(exc):
+                return
+            raise
+
+    async def finalize_pending_sample_request(self, interaction: discord.Interaction, owner_user_id: int) -> None:
+        request = self.pop_pending_sample_request(owner_user_id)
+        if request is None:
+            if interaction.response.is_done():
+                await self.send_ephemeral_message(interaction, content='Registro de amostra expirado.')
+            else:
+                await interaction.response.send_message('Registro de amostra expirado.', ephemeral=True)
+            return
+
+        items = request.get('items', []) if isinstance(request.get('items'), list) else []
+        if not items:
+            self.store_pending_sample_request(owner_user_id, request)
+            if interaction.response.is_done():
+                await self.send_ephemeral_message(interaction, content='Adicione pelo menos um item antes de finalizar.', view=SampleBuilderView(self, owner_user_id))
+            else:
+                await interaction.response.send_message('Adicione pelo menos um item antes de finalizar.', ephemeral=True)
+            return
+
+        payload = {
+            'source': 'discord',
+            'autor': interaction.user.display_name,
+            'autor_discord_id': str(interaction.user.id),
+            'ticket_channel_id': str(interaction.channel_id),
+            'member_name': str(request.get('member_name', '')).strip(),
+            'observacao': str(request.get('observacao', '')).strip(),
+            'items': items,
+        }
+
+        if not interaction.response.is_done():
+            deferred = await self.defer_ephemeral_safely(interaction)
+            if not deferred:
+                self.store_pending_sample_request(owner_user_id, request)
+                return
+
+        try:
+            await self.handle_member_sample(interaction, payload)
+        except FinanceApiError as exc:
+            self.store_pending_sample_request(owner_user_id, request)
+            await self.send_ephemeral_message(
+                interaction,
+                content=self.stock_action_error_message('registrar a amostra', exc) + '\n\nA amostra continua montada para nova tentativa.',
+                view=SampleBuilderView(self, owner_user_id),
+            )
+
+    def sample_builder_content(self, request: dict[str, Any], prefix: str | None = None) -> str:
+        member_name = str(request.get('member_name', 'Membro')).strip() or 'Membro'
+        observation = str(request.get('observacao', '')).strip()
+        items = request.get('items', []) if isinstance(request.get('items'), list) else []
+
+        lines = [f'Membro: {member_name}']
+        if observation:
+            lines.append(f'Observação: {observation}')
+
+        if items:
+            lines.append('Itens atuais:')
+            for index, item in enumerate(items, start=1):
+                label = str(item.get('label', '')).strip()
+                if not label:
+                    drug_label = {
+                        'maconha': 'Maconha',
+                        'cocaina': 'Cocaína',
+                        'metanfetamina': 'Metanfetamina',
+                    }.get(str(item.get('drug_type', '')), 'Droga')
+                    quantity = int(item.get('quantity', 0) or 0)
+                    parts = [f'{drug_label} {quantity}']
+                    rarity = str(item.get('rarity', '')).strip()
+                    source_scope = str(item.get('source_scope', '')).strip()
+                    if rarity:
+                        parts.append(rarity.title())
+                    if source_scope:
+                        parts.append(self.stock_scope_name(source_scope))
+                    label = ' | '.join(parts)
+                lines.append(f'{index}. {label}')
+        else:
+            lines.append('Nenhum item adicionado ainda.')
+
+        content = '\n'.join(lines)
+        if prefix:
+            return f'{prefix}\n\n{content}'
+        return content
+
+    def store_pending_members_payload(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_members_deposits[user_id] = payload
+
+    def pop_pending_members_payload(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_members_deposits.pop(user_id, None)
+
+    def discard_pending_members_payload(self, user_id: int) -> None:
+        self.pending_members_deposits.pop(user_id, None)
+
+    def store_pending_favela_payload(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_favela_deposits[user_id] = payload
+
+    def pop_pending_favela_payload(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_favela_deposits.pop(user_id, None)
+
+    def discard_pending_favela_payload(self, user_id: int) -> None:
+        self.pending_favela_deposits.pop(user_id, None)
+
+    def store_pending_mansoes_payload(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_mansoes_deposits[user_id] = payload
+
+    def pop_pending_mansoes_payload(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_mansoes_deposits.pop(user_id, None)
+
+    def discard_pending_mansoes_payload(self, user_id: int) -> None:
+        self.pending_mansoes_deposits.pop(user_id, None)
+
+    def store_pending_bangalo_payload(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_bangalo_deposits[user_id] = payload
+
+    def pop_pending_bangalo_payload(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_bangalo_deposits.pop(user_id, None)
+
+    def discard_pending_bangalo_payload(self, user_id: int) -> None:
+        self.pending_bangalo_deposits.pop(user_id, None)
+
+    def store_pending_bangalo2_payload(self, user_id: int, payload: dict[str, Any]) -> None:
+        self.pending_bangalo2_deposits[user_id] = payload
+
+    def pop_pending_bangalo2_payload(self, user_id: int) -> dict[str, Any] | None:
+        return self.pending_bangalo2_deposits.pop(user_id, None)
+
+    def discard_pending_bangalo2_payload(self, user_id: int) -> None:
+        self.pending_bangalo2_deposits.pop(user_id, None)
+
+    def close_role_ids(self) -> set[int]:
+        return role_ids_from_config('STOCK_CLOSE_ROLE_IDS')
+
+    def member_withdrawal_cannabis_label(self, quantities: dict[str, Any]) -> str:
+        labels = [
+            ('Comum', 'membros_comum'),
+            ('Incomum', 'membros_incomum'),
+            ('Raro', 'membros_raro'),
+            ('Mítica', 'membros_mitica'),
+            ('Lendária', 'membros_lendaria'),
+        ]
+        parts = [f'{label}: {int(quantities.get(field, 0) or 0)}x' for label, field in labels if int(quantities.get(field, 0) or 0) > 0]
+        if parts:
+            return '\n'.join(parts)
+        return 'Qtd: 0x'
+
+    def member_withdrawal_total_cannabis(self, quantities: dict[str, Any]) -> int:
+        return sum(
+            int(quantities.get(field, 0) or 0)
+            for field in ('membros_comum', 'membros_incomum', 'membros_raro', 'membros_mitica', 'membros_lendaria')
+        )
+
+    async def finalize_pending_member_withdrawal(self, interaction: discord.Interaction, cannabis_rarity: str) -> None:
+        pending = self.pop_pending_member_withdrawal_payload(interaction.user.id)
+        if pending is None:
+            await interaction.response.send_message('A solicitação expirou. Abra o registro novamente.', ephemeral=True)
+            return
+
+        self.discard_member_withdrawal_prompt(interaction.user.id, interaction.channel_id)
+
+        field_map = {
+            'comum': 'membros_comum',
+            'incomum': 'membros_incomum',
+            'raro': 'membros_raro',
+            'mitica': 'membros_mitica',
+            'lendaria': 'membros_lendaria',
+        }
+        target_field = field_map.get(cannabis_rarity.strip().lower())
+        if target_field is None:
+            self.store_pending_member_withdrawal_payload(interaction.user.id, pending)
+            await interaction.response.send_message('Tipo de maconha inválido.', ephemeral=True)
+            return
+
+        try:
+            payload = dict(pending)
+            maconha_qty = int(payload.pop('maconha', 0) or 0)
+            payload[target_field] = maconha_qty
+            await interaction.response.edit_message(content='Registrando retirada...', view=None)
+            await self.handle_member_withdrawal(interaction, payload)
+        except FinanceApiError as exc:
+            self.store_pending_member_withdrawal_payload(interaction.user.id, pending)
+            await self.send_ephemeral_message(
+                interaction,
+                content=self.stock_action_error_message('registrar retirada', exc),
+            )
+
+    def stock_target_name(self, target: str) -> str:
+        labels = {
+            'members': 'Bangalô Membros',
+            'favela': 'Baú da Favela',
+            'bangalo': 'Bangalô Estoque Gerência',
+            'bangalo2': 'Bangalô 2 Estoque Gerência',
+            'mansoes': 'Baú de Mansões',
+        }
+        return labels.get(target, 'Baú')
+
+    def stock_scope_name(self, scope: str) -> str:
+        labels = {
+            'members': 'Bangalô Membros',
+            'favela': 'Baú da Favela',
+            'bangalo': 'Bangalô Estoque Gerência',
+            'bangalo2': 'Bangalô 2 Estoque Gerência',
+            'mansoes': 'Baú de Mansões',
+            'all': 'Todos os Baús',
+        }
+        return labels.get(scope, 'Estoque')
+
+    def unified_transfer_modal_title(self, target: str) -> str:
+        titles = {
+            'members': 'Transferir do Bangalô Membros',
+            'favela': 'Transferir do Baú Favela',
+            'mansoes': 'Transferir do Baú Mansões',
+            'bangalo': 'Transferir do Bangalô Estoque Gerência',
+            'bangalo2': 'Transferir do Bangalô 2 Estoque Gerência',
+        }
+        return titles.get(target, 'Transferência de Estoque')
+
+    def unified_transfer_placeholder(self, target: str) -> str:
+        placeholders = {
+            'members': 'Ex: Transferência saindo do bangalô membros',
+            'favela': 'Ex: Transferência saindo do baú da favela',
+            'mansoes': 'Ex: Transferência saindo do baú de mansões',
+            'bangalo': 'Ex: Transferência saindo do bangalô estoque gerência',
+            'bangalo2': 'Ex: Transferência saindo do bangalô 2 estoque gerência',
+        }
+        return placeholders.get(target, 'Ex: Transferência de estoque')
+
+    def default_transfer_note(self, source_scope: str, destination_scope: str) -> str:
+        notes = {
+            'members': 'Transferência registrada via Discord do bangalô membros',
+            'favela': 'Transferência registrada via Discord do baú da favela',
+            'mansoes': 'Transferência registrada via Discord do baú de mansões',
+            'bangalo': 'Transferência registrada via Discord do bangalô estoque gerência',
+            'bangalo2': 'Transferência registrada via Discord do bangalô 2 estoque gerência',
+        }
+        base = notes.get(source_scope, 'Transferência registrada via Discord')
+        return base + ' para ' + self.stock_scope_name(destination_scope).lower()
+
+    def cannabis_rarity_target_field(self, target: str, rarity: str) -> str:
+        if target == 'members':
+            return 'membros_' + rarity
+        if target == 'mansoes':
+            return 'mansoes_' + rarity
+        if target == 'bangalo':
+            return 'bangalo_' + rarity
+        if target == 'bangalo2':
+            return 'bangalo2_' + rarity
+        return rarity
+
+    def build_unified_transfer_payload(self, request: dict[str, Any], cannabis_rarity: str, interaction: discord.Interaction) -> dict[str, Any]:
+        rarity = cannabis_rarity.strip().lower()
+        if rarity not in {'comum', 'incomum', 'raro', 'mitica', 'lendaria'}:
+            raise ValueError('Tipo de maconha inválido.')
+
+        source_scope = str(request.get('source_scope', 'favela')).strip().lower()
+        destination_scope = str(request.get('destination_scope', 'favela')).strip().lower()
+        maconha_qty = int(request.get('maconha', 0) or 0)
+        cocaina_qty = int(request.get('cocaina', 0) or 0)
+        metanfetamina_qty = int(request.get('metanfetamina', 0) or 0)
+
+        payload: dict[str, Any] = {
+            'autor': interaction.user.display_name,
+            'autor_discord_id': str(interaction.user.id),
+            'observacao': str(request.get('observacao', '')).strip() or self.default_transfer_note(source_scope, destination_scope),
+            'transfer_stock': True,
+            'transfer_source_scope': source_scope,
+            'transfer_destination_scope': destination_scope,
+        }
+
+        if source_scope == 'members':
+            payload['cocaina'] = cocaina_qty
+            payload['metanfetamina'] = metanfetamina_qty
+        elif source_scope == 'mansoes':
+            payload['mansoes_cocaina'] = cocaina_qty
+            payload['mansoes_metanfetamina'] = metanfetamina_qty
+        elif source_scope == 'bangalo':
+            payload['bangalo_cocaina'] = cocaina_qty
+            payload['bangalo_metanfetamina'] = metanfetamina_qty
+        elif source_scope == 'bangalo2':
+            payload['bangalo2_cocaina'] = cocaina_qty
+            payload['bangalo2_metanfetamina'] = metanfetamina_qty
+        else:
+            payload['favela_cocaina'] = cocaina_qty
+            payload['favela_metanfetamina'] = metanfetamina_qty
+
+        if maconha_qty > 0:
+            payload[self.cannabis_rarity_target_field(source_scope, rarity)] = maconha_qty
+
+        return payload
+
+    async def finalize_transfer_request(self, interaction: discord.Interaction, request: dict[str, Any], cannabis_rarity: str) -> None:
+        payload = self.build_unified_transfer_payload(request, cannabis_rarity, interaction)
+        await self.handle_manager_deposit(interaction, payload, str(request.get('source_scope', 'favela')))
+
+    async def handle_pending_transfer_destination(self, interaction: discord.Interaction, destination_scope: str) -> None:
+        request = self.pending_transfer_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.send_message('A solicitação expirou. Abra o fluxo novamente.', ephemeral=True)
+            return
+
+        source_scope = str(request.get('source_scope', '')).strip().lower()
+        if destination_scope == source_scope:
+            await interaction.response.send_message('Escolha um baú de destino diferente do baú de origem.', ephemeral=True)
+            return
+
+        request['destination_scope'] = destination_scope
+        self.store_pending_transfer_request(interaction.user.id, request)
+
+        if int(request.get('maconha', 0) or 0) > 0:
+            await interaction.response.edit_message(
+                content='Deseja informar qual é o tipo da maconha? Se escolher não, ela será transferida como Comum.',
+                view=CannabisTypeDecisionView(self, interaction.user.id),
+            )
+            return
+
+        request = self.pop_pending_transfer_request(interaction.user.id)
+        if request is None:
+            await interaction.response.send_message('A solicitação expirou. Abra o fluxo novamente.', ephemeral=True)
+            return
+        await self.finalize_transfer_request(interaction, request, 'comum')
+
+    async def finalize_pending_transfer(self, interaction: discord.Interaction, cannabis_rarity: str) -> None:
+        request = self.pop_pending_transfer_request(interaction.user.id)
+        if request is None:
+            await interaction.response.send_message('A solicitação expirou. Abra o fluxo novamente.', ephemeral=True)
+            return
+        await self.finalize_transfer_request(interaction, request, cannabis_rarity)
+
+    def stock_item_label(self, item: str) -> str:
+        labels = {
+            'maconha': 'Maconha',
+            'cocaina': 'Cocaína',
+            'metanfetamina': 'Metanfetamina',
+            'membros_comum': 'Membros Comum',
+            'membros_incomum': 'Membros Incomum',
+            'membros_raro': 'Membros Raro',
+            'membros_mitica': 'Membros Mítica',
+            'membros_lendaria': 'Membros Lendária',
+            'favela_cocaina': 'Favela Cocaína',
+            'favela_metanfetamina': 'Favela Metanfetamina',
+            'comum': 'Comum',
+            'incomum': 'Incomum',
+            'raro': 'Raro',
+            'mitica': 'Mítica',
+            'lendaria': 'Lendária',
+            'bangalo_maconha': 'Bangalô Maconha',
+            'bangalo_cocaina': 'Bangalô Cocaína',
+            'bangalo_metanfetamina': 'Bangalô Metanfetamina',
+            'bangalo_comum': 'Bangalô Comum',
+            'bangalo_incomum': 'Bangalô Incomum',
+            'bangalo_raro': 'Bangalô Raro',
+            'bangalo_mitica': 'Bangalô Mítica',
+            'bangalo_lendaria': 'Bangalô Lendária',
+            'bangalo2_maconha': 'Bangalô 2 Maconha',
+            'bangalo2_cocaina': 'Bangalô 2 Cocaína',
+            'bangalo2_metanfetamina': 'Bangalô 2 Metanfetamina',
+            'bangalo2_comum': 'Bangalô 2 Comum',
+            'bangalo2_incomum': 'Bangalô 2 Incomum',
+            'bangalo2_raro': 'Bangalô 2 Raro',
+            'bangalo2_mitica': 'Bangalô 2 Mítica',
+            'bangalo2_lendaria': 'Bangalô 2 Lendária',
+            'mansoes_cocaina': 'Mansões Cocaína',
+            'mansoes_metanfetamina': 'Mansões Metanfetamina',
+            'mansoes_comum': 'Mansões Comum',
+            'mansoes_incomum': 'Mansões Incomum',
+            'mansoes_raro': 'Mansões Raro',
+            'mansoes_mitica': 'Mansões Mítica',
+            'mansoes_lendaria': 'Mansões Lendária',
+        }
+        return labels.get(item, item)
+
+    def stock_adjusted_items_text(self, adjusted_items: dict[str, Any]) -> str:
+        if not adjusted_items:
+            return 'Nenhum item precisou de ajuste.'
+        parts = [f'{self.stock_item_label(item)}: {int(quantity or 0)}' for item, quantity in adjusted_items.items()]
+        return ' | '.join(parts)
+
+    def stock_scope_audit_fields(self, scope: str, adjusted_items: dict[str, Any], balance: dict[str, Any]) -> list[tuple[str, str, bool]]:
+        fields: list[tuple[str, str, bool]] = [
+            ('Escopo', self.stock_scope_name(scope), True),
+            ('Itens ajustados', self.stock_adjusted_items_text(adjusted_items), False),
+        ]
+        if scope == 'all':
+            fields.extend([
+                ('Saldo Membros', self.stock_target_balance_text('members', balance), False),
+                ('Saldo Favela', self.stock_target_balance_text('favela', balance), False),
+                ('Saldo Bangalô', self.stock_target_balance_text('bangalo', balance), False),
+                ('Saldo Bangalô 2', self.stock_target_balance_text('bangalo2', balance), False),
+                ('Saldo Mansões', self.stock_target_balance_text('mansoes', balance), False),
+            ])
+            return fields
+
+        fields.append(('Saldo atual', self.stock_target_balance_text(scope, balance), False))
+        return fields
+
+    def manager_modal_title(self, target: str) -> str:
+        titles = {
+            'members': 'Registrar Estoque Bangalô Membros',
+            'favela': 'Registrar Estoque Favela',
+            'bangalo': 'Registrar Estoque Bangalô Gerência',
+            'bangalo2': 'Registrar Estoque Bangalô 2 Gerência',
+            'mansoes': 'Registrar Estoque Mansões',
+        }
+        return titles.get(target, 'Registrar Estoque')
+
+    def transfer_target_name(self, source_scope: str) -> str:
+        labels = {
+            'members': 'Bangalô Membros',
+            'favela': 'Baú da Favela',
+            'bangalo': 'Bangalô Estoque Gerência',
+            'bangalo2': 'Bangalô 2 Estoque Gerência',
+            'mansoes': 'Baú de Mansões',
+        }
+        return labels.get(source_scope, 'Baú')
+
+    def transfer_quantities_text(self, quantities: dict[str, Any]) -> str:
+        parts = []
+        labels = [
+            ('cocaina', 'Cocaína'),
+            ('metanfetamina', 'Metanfetamina'),
+            ('comum', 'Comum'),
+            ('incomum', 'Incomum'),
+            ('raro', 'Raro'),
+            ('mitica', 'Mítica'),
+            ('lendaria', 'Lendária'),
+        ]
+        for field, label in labels:
+            quantity = int(quantities.get(field, 0) or 0)
+            if quantity > 0:
+                parts.append(f'{label}: {quantity}')
+        return ' | '.join(parts) if parts else 'Nenhum item transferido.'
+
+    def manager_modal_fields(self, target: str) -> list[tuple[str, str]]:
+        if target == 'favela':
+            return [
+                ('favela_cocaina', 'Cocaína'),
+                ('favela_metanfetamina', 'Metanfetamina'),
+                ('comum', 'Comum'),
+                ('incomum', 'Incomum'),
+                ('raro', 'Raro'),
+                ('mitica', 'Mítica'),
+                ('lendaria', 'Lendária'),
+            ]
+        if target == 'mansoes':
+            return [
+                ('mansoes_cocaina', 'Cocaína'),
+                ('mansoes_metanfetamina', 'Metanfetamina'),
+                ('mansoes_comum', 'Comum'),
+                ('mansoes_incomum', 'Incomum'),
+                ('mansoes_raro', 'Raro'),
+                ('mansoes_mitica', 'Mítica'),
+                ('mansoes_lendaria', 'Lendária'),
+            ]
+        return [
+            ('maconha', 'Maconha'),
+            ('cocaina', 'Cocaína'),
+            ('metanfetamina', 'Metanfetamina'),
+        ]
+
+    def stock_target_balance_text(self, target: str, balance: dict[str, Any]) -> str:
+        if target == 'members':
+            common_total = int(balance.get('maconha', 0) or 0) + int(balance.get('membros_comum', 0) or 0)
+            return (
+                f"COC {balance.get('cocaina', 0)} | MT {balance.get('metanfetamina', 0)} | "
+                f"C {common_total} | I {balance.get('membros_incomum', 0)} | "
+                f"R {balance.get('membros_raro', 0)} | MI {balance.get('membros_mitica', 0)} | L {balance.get('membros_lendaria', 0)}"
+            )
+        if target == 'favela':
+            return (
+                f"COC {balance.get('favela_cocaina', 0)} | MT {balance.get('favela_metanfetamina', 0)} | "
+                f"C {balance.get('comum', 0)} | I {balance.get('incomum', 0)} | "
+                f"R {balance.get('raro', 0)} | M {balance.get('mitica', 0)} | L {balance.get('lendaria', 0)}"
+            )
+        if target == 'bangalo':
+            return (
+                f"MA {balance.get('bangalo_maconha', 0)} | COC {balance.get('bangalo_cocaina', 0)} | MT {balance.get('bangalo_metanfetamina', 0)} | "
+                f"C {balance.get('bangalo_comum', 0)} | I {balance.get('bangalo_incomum', 0)} | "
+                f"R {balance.get('bangalo_raro', 0)} | MI {balance.get('bangalo_mitica', 0)} | L {balance.get('bangalo_lendaria', 0)}"
+            )
+        if target == 'bangalo2':
+            return (
+                f"MA {balance.get('bangalo2_maconha', 0)} | COC {balance.get('bangalo2_cocaina', 0)} | MT {balance.get('bangalo2_metanfetamina', 0)} | "
+                f"C {balance.get('bangalo2_comum', 0)} | I {balance.get('bangalo2_incomum', 0)} | "
+                f"R {balance.get('bangalo2_raro', 0)} | MI {balance.get('bangalo2_mitica', 0)} | L {balance.get('bangalo2_lendaria', 0)}"
+            )
+        if target == 'mansoes':
+            return (
+                f"COC {balance.get('mansoes_cocaina', 0)} | MT {balance.get('mansoes_metanfetamina', 0)} | "
+                f"C {balance.get('mansoes_comum', 0)} | I {balance.get('mansoes_incomum', 0)} | "
+                f"R {balance.get('mansoes_raro', 0)} | M {balance.get('mansoes_mitica', 0)} | L {balance.get('mansoes_lendaria', 0)}"
+            )
+        return f"M {balance.get('maconha', 0)} | C {balance.get('cocaina', 0)} | MT {balance.get('metanfetamina', 0)}"
+
+    def stock_target_audit_fields(self, target: str, quantities: dict[str, Any], balance: dict[str, Any], total_value_fmt: str) -> list[tuple[str, str, bool]]:
+        if target == 'members':
+            common_total = int(quantities.get('membros_comum', 0) or 0) + int(quantities.get('maconha', 0) or 0)
+            return [
+                ('Cocaína', str(quantities.get('cocaina', 0)), True),
+                ('Metanfetamina', str(quantities.get('metanfetamina', 0)), True),
+                ('Comum', str(common_total), True),
+                ('Incomum', str(quantities.get('membros_incomum', 0)), True),
+                ('Raro', str(quantities.get('membros_raro', 0)), True),
+                ('Mítica', str(quantities.get('membros_mitica', 0)), True),
+                ('Lendária', str(quantities.get('membros_lendaria', 0)), True),
+                ('Valor de referência', total_value_fmt, True),
+                ('Saldo atual', self.stock_target_balance_text(target, balance), False),
+            ]
+        if target == 'favela':
+            return [
+                ('Cocaína', str(quantities.get('favela_cocaina', 0)), True),
+                ('Metanfetamina', str(quantities.get('favela_metanfetamina', 0)), True),
+                ('Comum', str(quantities.get('comum', 0)), True),
+                ('Incomum', str(quantities.get('incomum', 0)), True),
+                ('Raro', str(quantities.get('raro', 0)), True),
+                ('Mítica', str(quantities.get('mitica', 0)), True),
+                ('Lendária', str(quantities.get('lendaria', 0)), True),
+                ('Saldo atual', self.stock_target_balance_text(target, balance), False),
+            ]
+        if target == 'bangalo':
+            return [
+                ('Maconha', str(quantities.get('bangalo_maconha', 0)), True),
+                ('Cocaína', str(quantities.get('bangalo_cocaina', 0)), True),
+                ('Metanfetamina', str(quantities.get('bangalo_metanfetamina', 0)), True),
+                ('Comum', str(quantities.get('bangalo_comum', 0)), True),
+                ('Incomum', str(quantities.get('bangalo_incomum', 0)), True),
+                ('Raro', str(quantities.get('bangalo_raro', 0)), True),
+                ('Mítica', str(quantities.get('bangalo_mitica', 0)), True),
+                ('Lendária', str(quantities.get('bangalo_lendaria', 0)), True),
+                ('Saldo atual', self.stock_target_balance_text(target, balance), False),
+            ]
+        if target == 'bangalo2':
+            return [
+                ('Maconha', str(quantities.get('bangalo2_maconha', 0)), True),
+                ('Cocaína', str(quantities.get('bangalo2_cocaina', 0)), True),
+                ('Metanfetamina', str(quantities.get('bangalo2_metanfetamina', 0)), True),
+                ('Comum', str(quantities.get('bangalo2_comum', 0)), True),
+                ('Incomum', str(quantities.get('bangalo2_incomum', 0)), True),
+                ('Raro', str(quantities.get('bangalo2_raro', 0)), True),
+                ('Mítica', str(quantities.get('bangalo2_mitica', 0)), True),
+                ('Lendária', str(quantities.get('bangalo2_lendaria', 0)), True),
+                ('Saldo atual', self.stock_target_balance_text(target, balance), False),
+            ]
+        if target == 'mansoes':
+            return [
+                ('Cocaína', str(quantities.get('mansoes_cocaina', 0)), True),
+                ('Metanfetamina', str(quantities.get('mansoes_metanfetamina', 0)), True),
+                ('Comum', str(quantities.get('mansoes_comum', 0)), True),
+                ('Incomum', str(quantities.get('mansoes_incomum', 0)), True),
+                ('Raro', str(quantities.get('mansoes_raro', 0)), True),
+                ('Mítica', str(quantities.get('mansoes_mitica', 0)), True),
+                ('Lendária', str(quantities.get('mansoes_lendaria', 0)), True),
+                ('Saldo atual', self.stock_target_balance_text(target, balance), False),
+            ]
+        return [
+            ('Maconha', str(quantities.get('maconha', 0)), True),
+            ('Cocaína', str(quantities.get('cocaina', 0)), True),
+            ('Metanfetamina', str(quantities.get('metanfetamina', 0)), True),
+            ('Valor de referência', total_value_fmt, True),
+            ('Saldo atual', self.stock_target_balance_text(target, balance), False),
+        ]
+
+    def stock_item_lines(self, prefix: str, quantities: dict[str, Any], include_zero: bool = False) -> list[str]:
+        labels = [
+            ('🌿', 'Maconha', 'maconha'),
+            ('💨', 'Cocaína', 'cocaina'),
+            ('🧊', 'Metanf.', 'metanfetamina'),
+        ]
+        lines: list[str] = []
+        for emoji, label, field in labels:
+            quantity = int(quantities.get(f'{prefix}{field}', 0) or 0)
+            if quantity <= 0 and not include_zero:
+                continue
+            lines.append(f'{emoji} {label}: {quantity}')
+        return lines
+
+    def rarity_stock_lines(self, quantities: dict[str, Any], prefix: str = '', include_zero: bool = False) -> list[str]:
+        labels = [
+            ('🍃', 'Comum', f'{prefix}comum'),
+            ('🟢', 'Incomum', f'{prefix}incomum'),
+            ('🔵', 'Raro', f'{prefix}raro'),
+            ('🔴', 'Mítica', f'{prefix}mitica'),
+            ('🟡', 'Lendária', f'{prefix}lendaria'),
+        ]
+        lines: list[str] = []
+        for emoji, label, field in labels:
+            quantity = int(quantities.get(field, 0) or 0)
+            if quantity <= 0 and not include_zero:
+                continue
+            lines.append(f'{emoji} {label}: {quantity}')
+        return lines
+
+    def format_deposit_lines(self, rows: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for row in rows:
+            author = str(row.get('autor', 'Gerência')).strip() or 'Gerência'
+            date = str(row.get('data', ''))
+            for label, field in [
+                ('Maconha', 'maconha'),
+                ('Cocaína', 'cocaina'),
+                ('Metanfetamina', 'metanfetamina'),
+                ('Membros Comum', 'membros_comum'),
+                ('Membros Incomum', 'membros_incomum'),
+                ('Membros Raro', 'membros_raro'),
+                ('Membros Mítica', 'membros_mitica'),
+                ('Membros Lendária', 'membros_lendaria'),
+                ('Favela Cocaína', 'favela_cocaina'),
+                ('Favela Metanfetamina', 'favela_metanfetamina'),
+                ('Bangalô Maconha', 'bangalo_maconha'),
+                ('Bangalô Cocaína', 'bangalo_cocaina'),
+                ('Bangalô Metanfetamina', 'bangalo_metanfetamina'),
+                ('Bangalô Comum', 'bangalo_comum'),
+                ('Bangalô Incomum', 'bangalo_incomum'),
+                ('Bangalô Raro', 'bangalo_raro'),
+                ('Bangalô Mítica', 'bangalo_mitica'),
+                ('Bangalô Lendária', 'bangalo_lendaria'),
+                ('Bangalô 2 Maconha', 'bangalo2_maconha'),
+                ('Bangalô 2 Cocaína', 'bangalo2_cocaina'),
+                ('Bangalô 2 Metanfetamina', 'bangalo2_metanfetamina'),
+                ('Bangalô 2 Comum', 'bangalo2_comum'),
+                ('Bangalô 2 Incomum', 'bangalo2_incomum'),
+                ('Bangalô 2 Raro', 'bangalo2_raro'),
+                ('Bangalô 2 Mítica', 'bangalo2_mitica'),
+                ('Bangalô 2 Lendária', 'bangalo2_lendaria'),
+                ('Mansões Cocaína', 'mansoes_cocaina'),
+                ('Mansões Metanfetamina', 'mansoes_metanfetamina'),
+            ]:
+                quantity = int(row.get(field, 0) or 0)
+                if quantity > 0:
+                    lines.append(f'{author} guardou {quantity}x {label} em {date}')
+        return lines or ['Nenhum depósito registrado nos últimos 7 dias.']
+
+    def format_transaction_lines(self, rows: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for row in rows:
+            author = str(row.get('autor', 'Sem autor')).strip() or 'Sem autor'
+            tx_type = str(row.get('tipo', '')).strip().lower()
+            amount = float(row.get('valor', 0) or 0)
+            reason = str(row.get('motivo', '')).strip() or 'Sem motivo'
+            date = str(row.get('data', ''))
+            if tx_type == 'deposito':
+                emoji = '🟢'
+                signal = '+'
+            else:
+                emoji = '🔴'
+                signal = '-'
+            lines.append(f'{emoji} {author}: {signal}{money_text(amount)} ({reason}) em {date}')
+        return lines or ['Nenhuma transação registrada nos últimos 7 dias.']
+
+    def format_withdrawal_lines(self, rows: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for row in rows:
+            author = str(row.get('autor', 'Membro')).strip() or 'Membro'
+            date = str(row.get('data', ''))
+            if bool(row.get('is_sample', False)):
+                sample_label = str(row.get('sample_label', '')).strip() or f'{int(row.get("quantidade_total", 0) or 0)} item(ns)'
+                lines.append(f'🎁 {author} registrou amostra: {sample_label} em {date}')
+                continue
+            parts: list[str] = []
+            for label, field in [('Comum', 'comum'), ('Cocaína', 'cocaina'), ('Metanfetamina', 'metanfetamina')]:
+                quantity = int(row.get(field, 0) or 0)
+                if quantity > 0:
+                    parts.append(f'{quantity}x {label}')
+            if not parts:
+                continue
+            total_value_fmt = str(row.get('total_value_fmt', 'R$ 0,00'))
+            lines.append(f'🛒 {author} retirou {" | ".join(parts)} (Pagar: {total_value_fmt}) em {date}')
+        return lines or ['Nenhuma retirada registrada nos últimos 7 dias.']
+
+    def format_transfer_lines(self, rows: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for row in rows:
+            author = str(row.get('autor', 'Sem autor')).strip() or 'Sem autor'
+            source_scope = str(row.get('origem', '')).strip() or 'Origem não informada'
+            destination_scope = str(row.get('destino', '')).strip() or 'Destino não informado'
+            items = str(row.get('itens', '')).strip() or 'Sem itens'
+            date = str(row.get('data', ''))
+            lines.append(f'🔁 {author} transferiu {items} de {source_scope} para {destination_scope} em {date}')
+        return lines or ['Nenhuma transferência registrada nos últimos 7 dias.']
+
+    def paginate_weekly_history(self, sections: list[tuple[str, list[str]]], max_chars: int = 3500) -> list[str]:
+        pages: list[str] = []
+        current_lines: list[str] = []
+
+        def flush_page() -> None:
+            if current_lines:
+                pages.append('\n'.join(current_lines).strip())
+                current_lines.clear()
+
+        for title, lines in sections:
+            block_lines = [title] + lines + ['']
+            if len('\n'.join(block_lines)) > max_chars:
+                chunk: list[str] = [title]
+                for line in lines:
+                    candidate = '\n'.join(chunk + [line])
+                    if len(candidate) > max_chars and len(chunk) > 1:
+                        if current_lines:
+                            flush_page()
+                        pages.append('\n'.join(chunk).strip())
+                        chunk = [title, line]
+                    else:
+                        chunk.append(line)
+                if len(chunk) > 1:
+                    if current_lines:
+                        flush_page()
+                    pages.append('\n'.join(chunk).strip())
+                continue
+
+            candidate_page = '\n'.join(current_lines + block_lines).strip()
+            if current_lines and len(candidate_page) > max_chars:
+                flush_page()
+            current_lines.extend(block_lines)
+
+        flush_page()
+        return pages or ['Sem dados para exibir.']
+
+    def resolve_ticket_category(self, guild: discord.Guild, fallback_channel: discord.abc.GuildChannel | None) -> discord.CategoryChannel | None:
+        category_id = int(getattr(config, 'STOCK_TICKET_CATEGORY_ID', 0) or 0)
+        if category_id > 0:
+            channel = guild.get_channel(category_id)
+            if isinstance(channel, discord.CategoryChannel):
+                return channel
+
+        for category in guild.categories:
+            if normalize_category_name(category.name) == 'ticket':
+                return category
+
+        if isinstance(fallback_channel, discord.TextChannel) and isinstance(fallback_channel.category, discord.CategoryChannel):
+            return fallback_channel.category
+
+        return None
+
+    def can_manage_stock(self, interaction: discord.Interaction) -> bool:
+        user = interaction.user
+        if not isinstance(user, discord.Member):
+            return False
+        return user.guild_permissions.administrator or user.guild_permissions.manage_guild or has_any_role(user, self.manager_role_ids())
+
+    def can_close_ticket(self, interaction: discord.Interaction) -> bool:
+        user = interaction.user
+        if not isinstance(user, discord.Member):
+            return False
+        return user.guild_permissions.administrator or user.guild_permissions.manage_channels or has_any_role(user, self.close_role_ids()) or has_any_role(user, self.manager_role_ids())
+
+    def panel_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title='📦 RETIRADA E ESTOQUE - LA FIRMA',
+            description=(
+                '**Registrar (Membro)** cria seu ticket privado para lançar retirada do baú e amostras.\n'
+                '**Transferência de Estoque** permite escolher o baú de origem e o baú de destino antes de registrar a movimentação.\n'
+                '**Histórico Semanal** soma banco, vendas e retiradas em tempo real, incluindo o Bangalô.'
+            ),
+            color=0xF59F00,
+        )
+        embed.set_footer(text='Retirada salva no site e auditada no Discord')
+        return embed
+
+    def ticket_embed(self, member: discord.abc.User) -> discord.Embed:
+        embed = discord.Embed(
+            title='Ticket de Retirada Aberto',
+            description=(
+                f'{member.mention}, use **Registrar Retirada** para lançamentos cobrados e **Registrar Amostra** para saídas grátis.\n'
+                'Quando terminar, a liderança pode usar **Fechar Ticket**.'
+            ),
+            color=0x0D6EFD,
+        )
+        embed.set_footer(text='Tudo que for lançado aqui será salvo no site')
+        return embed
+
+    def sample_registered_embed(
+        self,
+        member: discord.Member,
+        quantity: int,
+        item_count: int,
+        items_label: str,
+        observation: str = '',
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title='🎁 Amostra Registrada',
+            description=f'O membro {member.mention} registrou uma nova amostra.',
+            color=0xF05D5E,
+        )
+        embed.add_field(name='Itens', value=items_label or 'Sem itens', inline=False)
+        embed.add_field(name='Quantidade Total', value=str(quantity), inline=True)
+        embed.add_field(name='Linhas', value=str(item_count), inline=True)
+        if observation.strip():
+            embed.add_field(name='Observação', value=observation.strip(), inline=False)
+        embed.add_field(name='Cobrança', value='Amostra grátis', inline=False)
+        embed.set_footer(text='Essa saída baixa o estoque, mas não gera valor no financeiro.')
+        return embed
+
+    def withdrawal_registered_embed(
+        self,
+        member: discord.Member,
+        quantities: dict[str, Any],
+        prices: dict[str, Any],
+        total_value_fmt: str,
+        pix_key: str,
+        is_sample: bool,
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title='🎁 Amostra Registrada' if is_sample else '📝 Retirada Registrada',
+            description=f'O membro {member.mention} registrou uma nova {"amostra" if is_sample else "retirada"}.',
+            color=0xF05D5E,
+        )
+
+        labels = [
+            ('📦 Cocaína', 'cocaina', 'cocaina'),
+            ('📦 Metanfetamina', 'metanfetamina', 'metanfetamina'),
+        ]
+        unit_prices = []
+
+        cannabis_quantity = self.member_withdrawal_total_cannabis(quantities)
+        cannabis_unit_price = float(prices.get('maconha', 0) or 0)
+        unit_prices.append(cannabis_unit_price)
+        if is_sample:
+            cannabis_value_text = f'{self.member_withdrawal_cannabis_label(quantities)}\nCobrança: Não'
+        else:
+            cannabis_value_text = f'{self.member_withdrawal_cannabis_label(quantities)}\nValor: {money_text(cannabis_quantity * cannabis_unit_price)}'
+        embed.add_field(
+            name='📦 Maconha',
+            value=cannabis_value_text,
+            inline=True,
+        )
+
+        for label, field, price_field in labels:
+            quantity = int(quantities.get(field, 0) or 0)
+            unit_price = float(prices.get(price_field, 0) or 0)
+            unit_prices.append(unit_price)
+            if is_sample:
+                value_text = f'Qtd: {quantity}x\nCobrança: Não'
+            else:
+                value_text = f'Qtd: {quantity}x\nValor: {money_text(quantity * unit_price)}'
+            embed.add_field(
+                name=label,
+                value=value_text,
+                inline=True,
+            )
+
+        if is_sample:
+            embed.add_field(name='Cobrança', value='Amostra grátis', inline=False)
+            embed.set_footer(text='Essa saída baixa o estoque, mas não gera valor no financeiro.')
+            return embed
+
+        embed.add_field(name='Total a Pagar', value=total_value_fmt, inline=False)
+        embed.add_field(name='PIX', value=pix_key or 'Não informado', inline=False)
+
+        non_zero_prices = [price for price in unit_prices if price > 0]
+        if non_zero_prices and len(set(non_zero_prices)) == 1:
+            embed.set_footer(text=f'A taxa é de {money_text(non_zero_prices[0])} por unidade.')
+        else:
+            embed.set_footer(text='Os valores por item foram calculados conforme a tabela atual.')
+
+        return embed
+
+    async def send_panel(self, destination: discord.abc.Messageable) -> None:
+        await destination.send(embed=self.panel_embed(), view=StockPanelView(self))
+
+    def bot_member(self, guild: discord.Guild) -> discord.Member | None:
+        if self.bot.user is None:
+            return None
+        return guild.get_member(self.bot.user.id)
+
+    async def publish_panel(self, interaction: discord.Interaction, configured_channel_id: int) -> str:
+        fallback_channel = interaction.channel
+        if configured_channel_id <= 0:
+            if fallback_channel is None:
+                raise FinanceApiError('Canal atual indisponível para enviar o painel.')
+            await self.send_panel(fallback_channel)
+            return 'current'
+
+        try:
+            channel = self.bot.get_channel(configured_channel_id) or await self.bot.fetch_channel(configured_channel_id)
+            await self.send_panel(channel)
+            return 'configured'
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            if fallback_channel is None:
+                raise FinanceApiError(
+                    'O bot não conseguiu acessar o canal configurado do painel. Verifique o ID e as permissões de Ver canal e Enviar mensagens.'
+                )
+
+            await self.send_panel(fallback_channel)
+            return 'fallback'
+
+    async def audit_destination(self, interaction: discord.Interaction) -> discord.abc.Messageable | None:
+        channel_id = int(getattr(config, 'STOCK_LOG_CHANNEL_ID', 0) or 0)
+        if channel_id > 0:
+            try:
+                return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                LOGGER.warning('Nao foi possivel acessar STOCK_LOG_CHANNEL_ID=%s', channel_id)
+                return interaction.channel
+        return interaction.channel
+
+    async def send_audit_log(self, interaction: discord.Interaction, title: str, color: int, fields: list[tuple[str, str, bool]]) -> None:
+        destination = await self.audit_destination(interaction)
+        if destination is None:
+            return
+        embed = discord.Embed(title=title, color=color)
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        for name, value, inline in fields:
+            embed.add_field(name=name, value=value, inline=inline)
+        embed.set_footer(text='Persistido no site e auditado no Discord')
+        await destination.send(embed=embed, delete_after=self.audit_log_delete_after())
+
+    async def resolve_existing_ticket_channel(self, guild: discord.Guild, channel_id: str) -> tuple[discord.TextChannel | None, bool]:
+        try:
+            parsed_channel_id = int(channel_id)
+        except (TypeError, ValueError):
+            return None, True
+
+        cached_channel = guild.get_channel(parsed_channel_id)
+        if isinstance(cached_channel, discord.TextChannel):
+            return cached_channel, False
+
+        try:
+            fetched_channel = await self.bot.fetch_channel(parsed_channel_id)
+        except discord.NotFound:
+            return None, True
+        except (discord.Forbidden, discord.HTTPException):
+            return None, False
+
+        if isinstance(fetched_channel, discord.TextChannel) and fetched_channel.guild.id == guild.id:
+            return fetched_channel, False
+
+        return None, False
+
+    async def close_orphaned_ticket(self, channel_id: str) -> None:
+        bot_user = self.bot.user
+        closed_by_name = str(getattr(bot_user, 'display_name', '') or getattr(bot_user, 'name', '') or 'Bot Finance')
+        closed_by_discord_id = str(bot_user.id) if bot_user is not None else ''
+        await self.api.post('stock_ticket_close.php', {
+            'channel_discord_id': channel_id,
+            'closed_by_discord_id': closed_by_discord_id,
+            'closed_by_name': closed_by_name,
+        })
+
+    async def find_open_ticket_for_member(self, member_discord_id: str) -> dict[str, Any] | None:
+        member_discord_id = str(member_discord_id or '').strip()
+        if member_discord_id == '':
+            return None
+
+        data = await self.api.post('stock_ticket_find_open.php', {
+            'member_discord_id': member_discord_id,
+        })
+        ticket = data.get('ticket')
+        if not isinstance(ticket, dict):
+            return None
+        return ticket
+
+    async def find_ticket_for_channel(self, channel_discord_id: str) -> dict[str, Any] | None:
+        channel_discord_id = str(channel_discord_id or '').strip()
+        if channel_discord_id == '':
+            return None
+
+        data = await self.api.post('stock_ticket_find_by_channel.php', {
+            'channel_discord_id': channel_discord_id,
+        })
+        ticket = data.get('ticket')
+        if not isinstance(ticket, dict):
+            return None
+        return ticket
+
+    async def resolve_channel_delete_actor(self, guild: discord.Guild, channel_id: int) -> tuple[str | None, str]:
+        me = guild.me
+        if me is None or not me.guild_permissions.view_audit_log:
+            return None, 'Canal removido manualmente no Discord'
+
+        try:
+            async for entry in guild.audit_logs(action=discord.AuditLogAction.channel_delete, limit=8):
+                target = entry.target
+                if not isinstance(target, discord.abc.GuildChannel):
+                    continue
+                if int(getattr(target, 'id', 0) or 0) != channel_id:
+                    continue
+
+                created_at = entry.created_at
+                if created_at is not None:
+                    now_utc = dt.datetime.now(dt.timezone.utc)
+                    if (now_utc - created_at).total_seconds() > 120:
+                        continue
+
+                user = entry.user
+                if user is None:
+                    return None, 'Canal removido manualmente no Discord'
+
+                actor_id = str(int(user.id)) if getattr(user, 'id', None) is not None else None
+                actor_name = getattr(user, 'display_name', None) or getattr(user, 'name', None) or 'Canal removido manualmente no Discord'
+                return actor_id, str(actor_name)
+        except discord.Forbidden:
+            return None, 'Canal removido manualmente no Discord'
+        except discord.HTTPException:
+            return None, 'Canal removido manualmente no Discord'
+
+        return None, 'Canal removido manualmente no Discord'
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        try:
+            ticket = await self.find_ticket_for_channel(str(channel.id))
+            if not isinstance(ticket, dict):
+                return
+            if str(ticket.get('status', '')).strip().lower() != 'open':
+                return
+
+            actor_discord_id, actor_name = await self.resolve_channel_delete_actor(channel.guild, channel.id)
+            await self.api.post('stock_ticket_close.php', {
+                'channel_discord_id': str(channel.id),
+                'closed_by_discord_id': actor_discord_id or '',
+                'closed_by_name': actor_name,
+            })
+            LOGGER.info('Ticket fechado automaticamente após deleção manual do canal: channel_id=%s actor=%s', channel.id, actor_name)
+        except FinanceApiError as exc:
+            LOGGER.warning('Falha ao registrar fechamento de ticket após deleção manual do canal %s: %s', channel.id, exc)
+        except Exception:
+            LOGGER.exception('Erro inesperado ao processar deleção manual do canal %s', channel.id)
+
+    async def handle_member_ticket_open(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await self.send_ephemeral_message(interaction, content='Esse botão só funciona dentro do servidor.')
+            return
+
+        deferred = await self.defer_ephemeral_safely(interaction, thinking=True)
+        if not deferred:
+            return
+
+        guild = interaction.guild
+        bot_member = self.bot_member(guild)
+        if bot_member is None:
+            await self.send_ephemeral_message(interaction, content='Não consegui localizar o bot neste servidor para criar o ticket.')
+            return
+
+        if not bot_member.guild_permissions.manage_channels:
+            await self.send_ephemeral_message(interaction, content='O bot não tem a permissão Gerenciar Canais. Libere essa permissão no cargo do bot para criar tickets.')
+            return
+
+        category = self.resolve_ticket_category(guild, interaction.channel)
+
+        if isinstance(category, discord.CategoryChannel):
+            category_perms = category.permissions_for(bot_member)
+            if not category_perms.view_channel or not category_perms.manage_channels:
+                await self.send_ephemeral_message(interaction, content='O bot não tem acesso suficiente à categoria configurada para criar tickets. Verifique Ver Canal e Gerenciar Canais na categoria.')
+                return
+
+        existing_ticket = await self.find_open_ticket_for_member(str(interaction.user.id))
+        if existing_ticket is not None:
+            existing_channel_id = str(existing_ticket.get('discord_channel_id', '') or '').strip()
+            existing_channel, channel_missing = await self.resolve_existing_ticket_channel(guild, existing_channel_id)
+
+            if channel_missing and existing_channel_id != '':
+                LOGGER.warning(
+                    'Ticket órfão detectado para o membro %s no canal %s; fechando registro antigo antes de abrir um novo.',
+                    interaction.user.id,
+                    existing_channel_id,
+                )
+                try:
+                    await self.close_orphaned_ticket(existing_channel_id)
+                except FinanceApiError as exc:
+                    LOGGER.warning('Falha ao fechar ticket órfão do membro %s: %s', interaction.user.id, exc)
+                    await self.send_ephemeral_message(
+                        interaction,
+                        content='Existe um ticket antigo inconsistente e não foi possível limpá-lo agora. Chame um administrador para encerrar no painel.',
+                    )
+                    return
+            else:
+                mention = existing_channel.mention if existing_channel is not None else f'<#{existing_channel_id}>'
+                await self.send_ephemeral_message(interaction, content=f'Você já possui um ticket aberto em {mention}.')
+                return
+
+        channel_name = f'retirada-{sanitize_channel_name(interaction.user.display_name)}'
+        overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+        }
+
+        for role_id in self.support_role_ids():
+            role = guild.get_role(role_id)
+            if role is not None:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        try:
+            channel = await guild.create_text_channel(
+                name=channel_name,
+                overwrites=overwrites,
+                category=category,
+                topic=f'Ticket de retirada de {interaction.user.display_name} ({interaction.user.id})',
+                reason=f'Ticket de retirada criado por {interaction.user}',
+            )
+        except discord.Forbidden as exc:
+            raise FinanceApiError(
+                'O bot não conseguiu criar o canal do ticket. Verifique as permissões Gerenciar Canais e Ver Canal na categoria dos tickets.'
+            ) from exc
+        except discord.HTTPException as exc:
+            raise FinanceApiError(f'Erro ao criar o canal do ticket: {exc}') from exc
+
+        try:
+            payload = {
+                'member_discord_id': str(interaction.user.id),
+                'member_name': interaction.user.display_name,
+                'channel_discord_id': str(channel.id),
+                'channel_name': channel.name,
+            }
+            result = await self.api.post('stock_ticket_open.php', payload)
+        except FinanceApiError as exc:
+            await channel.send(
+                '⚠️ Não foi possível vincular este ticket no site agora. O canal foi mantido para revisão manual da gerência/ADM.'
+            )
+            raise FinanceApiError(f'Falha ao registrar ticket no site: {exc}') from exc
+
+        ticket = result.get('ticket', {}) if isinstance(result.get('ticket'), dict) else {}
+        existing_channel_id = str(ticket.get('discord_channel_id', ''))
+        if result.get('status') == 'existing' and existing_channel_id and existing_channel_id != str(channel.id):
+            existing_channel, channel_missing = await self.resolve_existing_ticket_channel(guild, existing_channel_id)
+            if channel_missing:
+                LOGGER.warning(
+                    'Ticket órfão detectado para o membro %s no canal %s; fechando registro antigo antes de reabrir.',
+                    interaction.user.id,
+                    existing_channel_id,
+                )
+                try:
+                    await self.close_orphaned_ticket(existing_channel_id)
+                    result = await self.api.post('stock_ticket_open.php', payload)
+                except FinanceApiError as exc:
+                    await channel.send(
+                        '⚠️ Ticket antigo inconsistente encontrado e não foi possível limpá-lo automaticamente. O canal foi mantido para revisão manual.'
+                    )
+                    raise FinanceApiError(f'Falha ao limpar ticket órfão: {exc}') from exc
+
+                ticket = result.get('ticket', {}) if isinstance(result.get('ticket'), dict) else {}
+                existing_channel_id = str(ticket.get('discord_channel_id', ''))
+                if result.get('status') != 'existing' or existing_channel_id == str(channel.id):
+                    await channel.send(content=interaction.user.mention, embed=self.ticket_embed(interaction.user), view=StockTicketView(self))
+                    await self.send_ephemeral_message(interaction, content=f'Ticket criado em {channel.mention}.')
+                    return
+
+                existing_channel, _ = await self.resolve_existing_ticket_channel(guild, existing_channel_id)
+
+            mention = existing_channel.mention if existing_channel is not None else f'<#{existing_channel_id}>'
+            await channel.send(
+                f'⚠️ Este ticket foi detectado como duplicado. Utilize o ticket original em {mention}. Este canal foi mantido para conferência manual.'
+            )
+            await self.send_ephemeral_message(interaction, content=f'Você já possui um ticket aberto em {mention}.')
+            return
+
+        await channel.send(content=interaction.user.mention, embed=self.ticket_embed(interaction.user), view=StockTicketView(self))
+        await self.send_ephemeral_message(interaction, content=f'Ticket criado em {channel.mention}.')
+
+    async def handle_pending_sample_rarity(self, interaction: discord.Interaction, rarity: str) -> None:
+        request = self.pending_sample_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.send_message('A solicitação expirou. Abra o fluxo novamente.', ephemeral=True)
+            return
+
+        draft_item = request.get('draft_item', {}) if isinstance(request.get('draft_item'), dict) else {}
+        draft_item['rarity'] = rarity
+        request['draft_item'] = draft_item
+        self.store_pending_sample_request(interaction.user.id, request)
+        await interaction.response.edit_message(
+            content='Selecione o baú de origem do item.',
+            view=SampleSourceSelectionView(self, interaction.user.id),
+        )
+
+    async def handle_pending_sample_source(self, interaction: discord.Interaction, source_scope: str) -> None:
+        request = self.pending_sample_requests.get(interaction.user.id)
+        if request is None:
+            await interaction.response.send_message('A solicitação expirou. Abra o fluxo novamente.', ephemeral=True)
+            return
+
+        draft_item = request.get('draft_item', {}) if isinstance(request.get('draft_item'), dict) else {}
+        if not draft_item:
+            await interaction.response.send_message('O item da amostra expirou. Reabra o fluxo.', ephemeral=True)
+            return
+
+        draft_item['source_scope'] = source_scope
+        if str(draft_item.get('drug_type', '')) == 'metanfetamina':
+            draft_item['rarity'] = None
+        elif not draft_item.get('rarity'):
+            draft_item['rarity'] = 'comum'
+
+        items = request.get('items', []) if isinstance(request.get('items'), list) else []
+        items.append(draft_item)
+        request['items'] = items
+        request.pop('draft_item', None)
+        self.store_pending_sample_request(interaction.user.id, request)
+
+        await interaction.response.edit_message(
+            content=self.sample_builder_content(request, prefix='Item adicionado à amostra.'),
+            view=SampleBuilderView(self, interaction.user.id),
+        )
+
+    async def handle_manager_deposit(self, interaction: discord.Interaction, payload: dict[str, Any], target: str = 'members') -> None:
+        payload = dict(payload)
+        payload['source'] = 'discord'
+        if payload.get('transfer_stock'):
+            payload['transfer_stock'] = True
+            payload['transfer_source_scope'] = payload.get('transfer_source_scope', target)
+            payload['transfer_destination_scope'] = payload.get('transfer_destination_scope', 'favela')
+
+        if not interaction.response.is_done():
+            deferred = await self.defer_ephemeral_safely(interaction)
+            if not deferred:
+                return
+
+        result = await self.api.post('stock_manager_deposit.php', payload)
+        quantities = result.get('quantities', {}) if isinstance(result.get('quantities'), dict) else {}
+        balance = result.get('balance', {}) if isinstance(result.get('balance'), dict) else {}
+        total_value_fmt = str(result.get('total_value_fmt', 'R$ 0,00'))
+        target_name = self.stock_target_name(target)
+
+        if result.get('transferred'):
+            source_scope = str(result.get('source_scope', target))
+            source_label = str(result.get('source_scope_label', self.transfer_target_name(source_scope)))
+            destination_scope = str(result.get('destination_scope', 'favela'))
+            destination_label = str(result.get('destination_scope_label', self.stock_scope_name(destination_scope)))
+            warnings = result.get('warnings', []) if isinstance(result.get('warnings'), list) else []
+
+            message = f'Transferência registrada de {source_label} para {destination_label}.'
+
+            if warnings:
+                message += '\n' + '\n'.join(str(item) for item in warnings if str(item).strip())
+
+            await self.send_ephemeral_message(interaction, content=message)
+
+            audit_fields: list[tuple[str, str, bool]] = [
+                ('Origem', source_label, True),
+                ('Destino', destination_label, True),
+                ('Itens', self.transfer_quantities_text(quantities), False),
+                ('Saldo destino', self.stock_target_balance_text(destination_scope, balance), False),
+            ]
+            if source_scope != destination_scope:
+                audit_fields.insert(3, ('Saldo origem', self.stock_target_balance_text(source_scope, balance), False))
+
+            await self.send_audit_log(
+                interaction,
+                'Transferência de estoque registrada',
+                0x198754,
+                audit_fields,
+            )
+            return
+
+        message = f'Entrada registrada no {target_name.lower()}.'
+        if target == 'members':
+            message += f' Valor de referência: {total_value_fmt}'
+        await self.send_ephemeral_message(interaction, content=message)
+
+        await self.send_audit_log(
+            interaction,
+            f'Entrada registrada em {target_name}',
+            0x198754,
+            self.stock_target_audit_fields(target, quantities, balance, total_value_fmt),
+        )
+
+    async def handle_member_withdrawal(self, interaction: discord.Interaction, payload: dict[str, Any]) -> None:
+        result = await self.api.post('stock_member_withdrawal.php', payload)
+        stock_entry_id = int(result.get('stock_entry_id', 0) or 0)
+        quantities = result.get('quantities', {}) if isinstance(result.get('quantities'), dict) else {}
+        prices = result.get('prices', {}) if isinstance(result.get('prices'), dict) else {}
+        warnings = result.get('warnings', []) if isinstance(result.get('warnings'), list) else []
+        total_value_fmt = str(result.get('total_value_fmt', 'R$ 0,00'))
+        pix_key = str(result.get('pix_key', 'lafirma( BlackBelt )')).strip()
+
+        message = f'Retirada registrada. Valor que precisa depositar: {total_value_fmt}'
+        if stock_entry_id > 0:
+            message += f'\nProtocolo do lançamento: #{stock_entry_id}'
+        message += f'\nAPI: {self.api.base_url}'
+        if warnings:
+            message += '\n' + '\n'.join(str(item) for item in warnings if str(item).strip())
+        await self.send_ephemeral_message(interaction, content=message)
+
+        if interaction.channel is not None and isinstance(interaction.user, discord.Member):
+            await interaction.channel.send(
+                embed=self.withdrawal_registered_embed(
+                    interaction.user,
+                    quantities,
+                    prices,
+                    total_value_fmt,
+                    pix_key,
+                    False,
+                ),
+            )
+
+        await self.send_audit_log(
+            interaction,
+            'Retirada de membro registrada',
+            0xF59F00,
+            [
+                ('Maconha', self.member_withdrawal_cannabis_label(quantities).replace('\n', ' | '), False),
+                ('Cocaína', str(quantities.get('cocaina', 0)), True),
+                ('Metanfetamina', str(quantities.get('metanfetamina', 0)), True),
+                ('Cobrança', total_value_fmt, True),
+                ('Origem', 'Ticket + Site', True),
+            ],
+        )
+
+    async def handle_member_sample(self, interaction: discord.Interaction, payload: dict[str, Any]) -> None:
+        try:
+            result = await self.api.post('stock_member_sample.php', payload)
+        except FinanceApiError as exc:
+            message = str(exc)
+            if 'stock_member_sample.php' in message or 'Resposta não JSON da API (404' in message:
+                raise FinanceApiError(
+                    'o endpoint de amostra não foi encontrado no site publicado. Publique o arquivo api/stock_member_sample.php junto com includes/drug_stock.php antes de tentar novamente.'
+                ) from exc
+            raise
+        warnings = result.get('warnings', []) if isinstance(result.get('warnings'), list) else []
+        items_label = str(result.get('items_label', '')).strip() or str(result.get('drug_label', 'Amostra'))
+        quantity = int(result.get('quantity', 0) or 0)
+        item_count = int(result.get('item_count', 0) or 0)
+        observation = str(result.get('observacao', '')).strip()
+
+        message = f'Amostra registrada: {items_label}'
+        if item_count > 1:
+            message += f' ({item_count} itens)'
+        if observation:
+            message += f'\nObservação: {observation}'
+        if warnings:
+            message += '\n' + '\n'.join(str(item) for item in warnings if str(item).strip())
+        await self.send_ephemeral_message(interaction, content=message)
+
+        if interaction.channel is not None and isinstance(interaction.user, discord.Member):
+            await interaction.channel.send(
+                embed=self.sample_registered_embed(interaction.user, quantity, item_count, items_label, observation),
+                delete_after=self.audit_log_delete_after(),
+            )
+
+        await self.send_audit_log(
+            interaction,
+            'Amostra de membro registrada',
+            0xF05D5E,
+            [
+                ('Itens', items_label, False),
+                ('Quantidade total', str(quantity), True),
+                ('Linhas', str(item_count), True),
+                ('Observação', observation or 'Sem observação', False),
+                ('Cobrança', 'Amostra grátis', True),
+            ],
+        )
+
+    async def handle_stock_reset_scope(self, interaction: discord.Interaction, scope: str) -> None:
+        result = await self.api.post('stock_reset_scope.php', {
+            'autor': interaction.user.display_name,
+            'autor_discord_id': str(interaction.user.id),
+            'scope': scope,
+            'observacao': f'Zeragem via Discord: {self.stock_scope_name(scope)}',
+        })
+        adjusted_items = result.get('adjusted_items', {}) if isinstance(result.get('adjusted_items'), dict) else {}
+        balance = result.get('balance', {}) if isinstance(result.get('balance'), dict) else {}
+        scope_name = self.stock_scope_name(scope)
+
+        if result.get('already_zero'):
+            message = f'{scope_name} já estava zerado.'
+        else:
+            message = f'{scope_name} zerado com sucesso. Ajustes: {self.stock_adjusted_items_text(adjusted_items)}'
+
+        await self.send_ephemeral_message(interaction, content=message)
+
+        if result.get('already_zero'):
+            return
+
+        await self.send_audit_log(
+            interaction,
+            f'Estoque zerado em {scope_name}',
+            0xDC3545,
+            self.stock_scope_audit_fields(scope, adjusted_items, balance),
+        )
+
+    async def handle_close_ticket(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
+            await self.send_ephemeral_message(interaction, content='Esse botão só funciona em um ticket do servidor.')
+            return
+
+        if not self.can_close_ticket(interaction):
+            await self.send_ephemeral_message(interaction, content='Você não tem permissão para fechar este ticket.')
+            return
+
+        deferred = await self.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+
+        result = await self.api.post('stock_ticket_close.php', {
+            'channel_discord_id': str(interaction.channel.id),
+            'closed_by_discord_id': str(interaction.user.id),
+            'closed_by_name': interaction.user.display_name,
+        })
+        ticket = result.get('ticket', {}) if isinstance(result.get('ticket'), dict) else {}
+        await self.send_audit_log(
+            interaction,
+            'Ticket fechado',
+            0xDC3545,
+            [
+                ('Canal', interaction.channel.mention, False),
+                ('Membro', str(ticket.get('member_name', 'Não identificado')), False),
+            ],
+        )
+
+        await self.send_ephemeral_message(interaction, content='Ticket fechado e removido.')
+
+        try:
+            await interaction.channel.delete(reason=f'Ticket encerrado por {interaction.user}')
+        except discord.Forbidden as exc:
+            raise FinanceApiError('O bot não conseguiu excluir o canal do ticket. Verifique a permissão Gerenciar Canais.') from exc
+        except discord.HTTPException as exc:
+            raise FinanceApiError(f'Erro ao excluir o canal do ticket: {exc}') from exc
+
+    async def handle_weekly_history(self, interaction: discord.Interaction) -> None:
+        deferred = await self.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        data = await self.api.get('stock_weekly_history.php')
+        financial = data.get('financial', {}) if isinstance(data.get('financial'), dict) else {}
+        withdrawals = data.get('withdrawals', {}) if isinstance(data.get('withdrawals'), dict) else {}
+        recent = data.get('recent', {}) if isinstance(data.get('recent'), dict) else {}
+        stock = data.get('stock', {}) if isinstance(data.get('stock'), dict) else {}
+        balance = stock.get('balance', {}) if isinstance(stock.get('balance'), dict) else {}
+        period = data.get('period', {}) if isinstance(data.get('period'), dict) else {}
+
+        deposit_rows = recent.get('deposits', []) if isinstance(recent.get('deposits'), list) else []
+        transaction_rows = recent.get('transactions', []) if isinstance(recent.get('transactions'), list) else []
+        withdrawal_rows = withdrawals.get('rows', []) if isinstance(withdrawals.get('rows'), list) else []
+        transfer_rows = recent.get('transfers', []) if isinstance(recent.get('transfers'), list) else []
+
+        sections = [
+            (
+                '🏦 Banco da Facção',
+                [
+                    str(financial.get('total_banco_fmt', 'R$ 0,00')),
+                    '',
+                    '📦 Bangalô Membros',
+                    f'💨 Cocaína: {int(balance.get("cocaina", 0) or 0)}',
+                    f'🧊 Metanf.: {int(balance.get("metanfetamina", 0) or 0)}',
+                    f'🍃 Comum: {int(balance.get("maconha", 0) or 0) + int(balance.get("membros_comum", 0) or 0)}',
+                    *self.rarity_stock_lines(balance, prefix='membros_', include_zero=True),
+                    '',
+                    '🌿 Baú da Favela',
+                    *self.stock_item_lines('favela_', balance, include_zero=True),
+                    *self.rarity_stock_lines(balance, include_zero=True),
+                    '',
+                    '🏡 Bangalô Estoque Gerência',
+                    *self.stock_item_lines('bangalo_', balance, include_zero=True),
+                    *self.rarity_stock_lines(balance, prefix='bangalo_', include_zero=True),
+                    '',
+                    '🏠 Bangalô 2 Estoque Gerência',
+                    *self.stock_item_lines('bangalo2_', balance, include_zero=True),
+                    *self.rarity_stock_lines(balance, prefix='bangalo2_', include_zero=True),
+                    '',
+                    '🏘️ Baú de Mansões',
+                    *self.stock_item_lines('mansoes_', balance, include_zero=True),
+                    *self.rarity_stock_lines(balance, prefix='mansoes_', include_zero=True),
+                ],
+            ),
+            (
+                f'📝 Depósitos ({period.get("label", "Últimos 7 dias")})',
+                self.format_deposit_lines(deposit_rows),
+            ),
+            (
+                f'💸 Transações ({period.get("label", "Últimos 7 dias")})',
+                self.format_transaction_lines(transaction_rows),
+            ),
+            (
+                f'🛒 Retiradas a Pagar ({period.get("label", "Últimos 7 dias")})',
+                self.format_withdrawal_lines(withdrawal_rows),
+            ),
+            (
+                f'🔁 Transferências ({period.get("label", "Últimos 7 dias")})',
+                self.format_transfer_lines(transfer_rows),
+            ),
+        ]
+
+        pages = self.paginate_weekly_history(sections)
+        view = WeeklyHistoryView(self, interaction.user.id, pages)
+        await self.send_ephemeral_message(interaction, embed=view.current_embed(), view=view)
+
+    @app_commands.command(name='painelretirada', description='Envia o painel de retirada e estoque.')
+    async def painel_retirada(self, interaction: discord.Interaction) -> None:
+        deferred = await self.defer_ephemeral_safely(interaction)
+        if not deferred:
+            return
+        channel_id = int(getattr(config, 'STOCK_PANEL_CHANNEL_ID', 0) or 0)
+        destination = await self.publish_panel(interaction, channel_id)
+
+        if destination == 'configured':
+            await self.send_ephemeral_message(interaction, content='Painel de retirada enviado no canal configurado.')
+            return
+
+        if destination == 'fallback' and channel_id > 0:
+            await self.send_ephemeral_message(interaction, content='O bot não conseguiu acessar o canal configurado em STOCK_PANEL_CHANNEL_ID. Enviei o painel neste canal. Verifique o ID e as permissões do bot.')
+            return
+
+        await self.send_ephemeral_message(interaction, content='Painel de retirada enviado neste canal.')
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(StockCog(bot))
